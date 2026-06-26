@@ -1,0 +1,4 @@
+# Baseline config: the agent gets the task prompt + raw repo checkout. No CLAUDE.md.
+# Pure model + repo. This is the control arm of the MVP comparison (LLD.md §7).
+name: baseline
+claude_md: null

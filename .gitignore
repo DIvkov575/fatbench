@@ -1,0 +1,17 @@
+# Vendored system-under-test: its OWN git repo (github.com/zulip/zulip), pinned at the
+# task parent commit. Never embed it here — it is a fixture, fetched separately. ~260M.
+repos/
+
+# Python virtualenv (regenerate via: python3 -m venv .venv && .venv/bin/pip install -r harness/requirements.txt)
+.venv/
+
+# Session memory / handoff buffer — private, not part of the benchmark.
+.remember/
+
+# Run artifacts — regenerable by re-running the harness.
+results/
+
+# Python caches
+__pycache__/
+*.py[cod]
+.pytest_cache/

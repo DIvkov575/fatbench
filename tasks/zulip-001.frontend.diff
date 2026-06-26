@@ -1,0 +1,465 @@
+commit 62c67eae8ecd1f4cf954fc483f8c575eae3e7c45
+Author: Kunal Sharma <v.shm.kunal@gmail.com>
+Date:   Sat Jun 14 11:19:57 2025 +0000
+
+    settings: Add a new `topics_policy` realm setting.
+    
+    Added a new realm setting, `topics_policy` and deprecated
+    `mandatory_topics` setting as it now replaced by `topics_policy`.
+    
+    Fixes part of #33549.
+
+diff --git a/api_docs/unmerged.d/ZF-d9265f.md b/api_docs/unmerged.d/ZF-d9265f.md
+new file mode 100644
+index 0000000000..76df629833
+--- /dev/null
++++ b/api_docs/unmerged.d/ZF-d9265f.md
+@@ -0,0 +1,8 @@
++* `PATCH /realm`, [`GET /events`](/api/get-events),
++  [`POST /register`](/api/register-queue):
++  Added a new realm setting, `topics_policy` defining the
++  default configuration for sending messages in empty topics.
++* [`GET /events`](/api/get-events), [`POST /register`](/api/register-queue):
++  Deprecated `mandatory_topics` field in favor of `topics_policy` realm setting.
++* `PATCH /realm`: Removed `mandatory_topics` field as it is now replaced by
++  `topics_policy` field.
+diff --git a/web/src/admin.ts b/web/src/admin.ts
+index 5424a28241..be616397d8 100644
+--- a/web/src/admin.ts
++++ b/web/src/admin.ts
+@@ -25,6 +25,7 @@ import * as settings_toggle from "./settings_toggle.ts";
+ import * as settings_users from "./settings_users.ts";
+ import {current_user, realm} from "./state_data.ts";
+ import {the} from "./util.ts";
++import * as util from "./util.ts";
+ 
+ const admin_settings_label = {
+     // Organization profile
+@@ -32,7 +33,6 @@ const admin_settings_label = {
+         defaultMessage: "Advertise organization in the Zulip communities directory",
+     }),
+     // Organization settings
+-    realm_mandatory_topics: $t({defaultMessage: "Require topics in channel messages"}),
+     realm_new_stream_announcements_stream: $t({defaultMessage: "New channel announcements"}),
+     realm_signup_announcements_stream: $t({defaultMessage: "New user announcements"}),
+     realm_zulip_update_announcements_stream: $t({defaultMessage: "Zulip update announcements"}),
+@@ -182,7 +182,9 @@ export function build_page(): void {
+         realm_logo_url: realm.realm_logo_url,
+         realm_night_logo_source: realm.realm_night_logo_source,
+         realm_night_logo_url,
+-        realm_mandatory_topics: realm.realm_mandatory_topics,
++        realm_topics_policy: realm.realm_topics_policy,
++        realm_topics_policy_values: settings_config.get_realm_topics_policy_values(),
++        empty_string_topic_display_name: util.get_final_topic_display_name(""),
+         realm_send_welcome_emails: realm.realm_send_welcome_emails,
+         realm_message_content_allowed_in_email_notifications:
+             realm.realm_message_content_allowed_in_email_notifications,
+diff --git a/web/src/server_events_dispatch.js b/web/src/server_events_dispatch.js
+index 8a957bd450..fef70912fc 100644
+--- a/web/src/server_events_dispatch.js
++++ b/web/src/server_events_dispatch.js
+@@ -262,7 +262,6 @@ export function dispatch_normal_event(event) {
+                 inline_image_preview: noop,
+                 inline_url_embed_preview: noop,
+                 invite_required: noop,
+-                mandatory_topics: noop,
+                 message_content_edit_limit_seconds: noop,
+                 message_content_delete_limit_seconds: noop,
+                 message_edit_history_visibility_policy: noop,
+@@ -276,6 +275,7 @@ export function dispatch_normal_event(event) {
+                 push_notifications_enabled: noop,
+                 require_unique_names: noop,
+                 send_welcome_emails: noop,
++                topics_policy: noop,
+                 message_content_allowed_in_email_notifications: noop,
+                 enable_spectator_access: noop,
+                 signup_announcements_stream_id: noop,
+@@ -306,11 +306,6 @@ export function dispatch_normal_event(event) {
+                                 "can_create_web_public_channel_group",
+                             );
+                         }
+-
+-                        if (event.property === "mandatory_topics") {
+-                            compose_recipient.update_topic_inputbox_on_mandatory_topics_change();
+-                            compose_recipient.update_compose_area_placeholder_text();
+-                        }
+                     }
+                     break;
+                 case "update_dict":
+@@ -323,6 +318,11 @@ export function dispatch_normal_event(event) {
+                                     realm["realm_" + key] = value;
+                                 }
+ 
++                                if (key === "topics_policy") {
++                                    compose_recipient.update_topic_inputbox_on_topics_policy_change();
++                                    compose_recipient.update_compose_area_placeholder_text();
++                                }
++
+                                 if (Object.hasOwn(realm_settings, key)) {
+                                     settings_org.sync_realm_settings(key);
+                                     realm_settings[key]();
+diff --git a/web/src/settings_components.ts b/web/src/settings_components.ts
+index 0fb9e763c1..cf7e47c3c1 100644
+--- a/web/src/settings_components.ts
++++ b/web/src/settings_components.ts
+@@ -243,6 +243,7 @@ export function get_subsection_property_elements($subsection: JQuery): HTMLEleme
+ export const simple_dropdown_realm_settings_schema = realm_schema.pick({
+     realm_org_type: true,
+     realm_message_edit_history_visibility_policy: true,
++    realm_topics_policy: true,
+ });
+ export type SimpleDropdownRealmSettings = z.infer<typeof simple_dropdown_realm_settings_schema>;
+ 
+diff --git a/web/src/settings_config.ts b/web/src/settings_config.ts
+index 78a360925d..5f926dbb73 100644
+--- a/web/src/settings_config.ts
++++ b/web/src/settings_config.ts
+@@ -16,6 +16,7 @@ import type {
+     StreamNotificationSettings,
+     UserSettings,
+ } from "./user_settings.ts";
++import * as util from "./util.ts";
+ 
+ /*
+     This file contains translations between the integer values used in
+@@ -292,6 +293,34 @@ export const message_edit_history_visibility_policy_values = {
+     },
+ };
+ 
++type PolicyValue = {
++    code: string;
++    description: string;
++};
++
++type RealmTopicsPolicyValues = {
++    allow_empty_topic: PolicyValue;
++    disable_empty_topic: PolicyValue;
++};
++
++export const get_realm_topics_policy_values = (): RealmTopicsPolicyValues => {
++    const empty_topic_name = util.get_final_topic_display_name("");
++
++    return {
++        allow_empty_topic: {
++            code: "allow_empty_topic",
++            description: $t(
++                {defaultMessage: '"{empty_topic_name}" topic allowed'},
++                {empty_topic_name},
++            ),
++        },
++        disable_empty_topic: {
++            code: "disable_empty_topic",
++            description: $t({defaultMessage: 'No "{empty_topic_name}" topic'}, {empty_topic_name}),
++        },
++    };
++};
++
+ export const time_limit_dropdown_values = [
+     {
+         text: $t({defaultMessage: "Any time"}),
+diff --git a/web/src/state_data.ts b/web/src/state_data.ts
+index b0d3871f0f..73bfe59e8c 100644
+--- a/web/src/state_data.ts
++++ b/web/src/state_data.ts
+@@ -383,7 +383,6 @@ export const realm_schema = z.object({
+     realm_linkifiers: z.array(realm_linkifier_schema),
+     realm_logo_source: z.string(),
+     realm_logo_url: z.string(),
+-    realm_mandatory_topics: z.boolean(),
+     realm_message_content_allowed_in_email_notifications: z.boolean(),
+     realm_message_content_edit_limit_seconds: z.number().nullable(),
+     realm_message_content_delete_limit_seconds: z.number().nullable(),
+@@ -406,6 +405,7 @@ export const realm_schema = z.object({
+     realm_require_unique_names: z.boolean(),
+     realm_send_welcome_emails: z.boolean(),
+     realm_signup_announcements_stream_id: z.number(),
++    realm_topics_policy: z.enum(["allow_empty_topic", "disable_empty_topic"]),
+     realm_upload_quota_mib: z.nullable(z.number()),
+     realm_url: z.string(),
+     realm_video_chat_provider: z.number(),
+diff --git a/web/src/stream_data.ts b/web/src/stream_data.ts
+index 61496f53ed..b1e21b2426 100644
+--- a/web/src/stream_data.ts
++++ b/web/src/stream_data.ts
+@@ -1003,7 +1003,10 @@ export function can_use_empty_topic(stream_id: number | undefined): boolean {
+         return false;
+     }
+ 
+-    return !realm.realm_mandatory_topics;
++    return (
++        realm.realm_topics_policy ===
++        settings_config.get_realm_topics_policy_values().allow_empty_topic.code
++    );
+ }
+ 
+ /*
+diff --git a/web/src/util.ts b/web/src/util.ts
+index 1eb537c91a..93551228bf 100644
+--- a/web/src/util.ts
++++ b/web/src/util.ts
+@@ -558,9 +558,9 @@ export function get_final_topic_display_name(topic_name: string): string {
+ }
+ 
+ export function is_topic_name_considered_empty(topic: string): boolean {
+-    // NOTE: Use this check only when realm.realm_mandatory_topics is set to true.
++    // NOTE: Use this check only when realm.realm_topics_policy is set to disable_empty_topic.
+     topic = topic.trim();
+-    // When the topic is mandatory in a realm via realm_mandatory_topics, the topic
++    // When the topic is mandatory in a realm via realm_topics_policy, the topic
+     // can't be an empty string, "(no topic)", or the displayed topic name for empty string.
+     if (topic === "" || topic === "(no topic)" || topic === get_final_topic_display_name("")) {
+         return true;
+diff --git a/web/templates/settings/organization_settings_admin.hbs b/web/templates/settings/organization_settings_admin.hbs
+index dd4838717a..0ca0cf4c00 100644
+--- a/web/templates/settings/organization_settings_admin.hbs
++++ b/web/templates/settings/organization_settings_admin.hbs
+@@ -126,11 +126,12 @@
+                     </select>
+                 </div>
+ 
+-                {{> settings_checkbox
+-                  setting_name="realm_mandatory_topics"
+-                  prefix="id_"
+-                  is_checked=realm_mandatory_topics
+-                  label=admin_settings_label.realm_mandatory_topics}}
++                <div class="input-group">
++                    <label for="id_realm_topics_policy" class="settings-field-label">{{> realm_topics_policy_label .}}</label>
++                    <select name="realm_topics_policy" id="id_realm_topics_policy" class="prop-element settings_select bootstrap-focus-style" data-setting-widget-type="string">
++                        {{> dropdown_options_widget option_values=realm_topics_policy_values}}
++                    </select>
++                </div>
+             </div>
+         </div>
+ 
+diff --git a/web/templates/settings/realm_topics_policy_label.hbs b/web/templates/settings/realm_topics_policy_label.hbs
+new file mode 100644
+index 0000000000..86b390deb3
+--- /dev/null
++++ b/web/templates/settings/realm_topics_policy_label.hbs
+@@ -0,0 +1,4 @@
++{{#tr}}
++    Default <z-empty-string-topic-display-name></z-empty-string-topic-display-name> topic configuration for channels
++    {{#*inline "z-empty-string-topic-display-name"}}<span class="empty-topic-display">{{empty_string_topic_display_name}}</span>{{/inline}}
++{{/tr}}
+diff --git a/web/tests/compose.test.cjs b/web/tests/compose.test.cjs
+index 4063e0ce59..7d349409e0 100644
+--- a/web/tests/compose.test.cjs
++++ b/web/tests/compose.test.cjs
+@@ -450,6 +450,7 @@ test_ui("handle_enter_key_with_preview_open", ({override, override_rewire}) => {
+     override_rewire(compose, "send_message", () => {
+         send_message_called = true;
+     });
++    override(realm, "realm_topics_policy", "allow_empty_topic");
+ 
+     compose.handle_enter_key_with_preview_open();
+     fake_compose_box.assert_preview_mode_is_off();
+diff --git a/web/tests/compose_actions.test.cjs b/web/tests/compose_actions.test.cjs
+index 84d7514d80..b2a2baf7de 100644
+--- a/web/tests/compose_actions.test.cjs
++++ b/web/tests/compose_actions.test.cjs
+@@ -91,7 +91,9 @@ const stream_data = zrequire("stream_data");
+ const compose_recipient = zrequire("compose_recipient");
+ const {set_realm} = zrequire("state_data");
+ 
+-const realm = {realm_mandatory_topics: true};
++const realm = {
++    realm_topics_policy: "disable_empty_topic",
++};
+ set_realm(realm);
+ 
+ const start = compose_actions.start;
+diff --git a/web/tests/compose_fade.test.cjs b/web/tests/compose_fade.test.cjs
+index 4ab3d1db1c..6b816787c1 100644
+--- a/web/tests/compose_fade.test.cjs
++++ b/web/tests/compose_fade.test.cjs
+@@ -114,13 +114,13 @@ run_test("want_normal_display", ({override}) => {
+ 
+     // Focused recipient is a valid stream with no topic set
+     // when topics are mandatory
+-    override(realm, "realm_mandatory_topics", true);
++    override(realm, "realm_topics_policy", "disable_empty_topic");
+     stream_data.add_sub(sub);
+     assert.ok(compose_fade_helper.want_normal_display());
+ 
+     // Focused recipient is a valid stream with no topic set
+     // when topics are not mandatory. Focused to input box.
+-    override(realm, "realm_mandatory_topics", false);
++    override(realm, "realm_topics_policy", "allow_empty_topic");
+     assert.ok(compose_fade_helper.want_normal_display());
+ 
+     // If we're focused to a topic, then we do want to fade.
+diff --git a/web/tests/compose_ui.test.cjs b/web/tests/compose_ui.test.cjs
+index ae415f63ce..a5ccca4ee7 100644
+--- a/web/tests/compose_ui.test.cjs
++++ b/web/tests/compose_ui.test.cjs
+@@ -1296,12 +1296,12 @@ run_test("get_focus_area", ({override}) => {
+         get_focus_area({message_type: "stream"}),
+         "#compose_select_recipient_widget_wrapper",
+     );
+-    override(realm, "realm_mandatory_topics", true);
++    override(realm, "realm_topics_policy", "disable_empty_topic");
+     assert.equal(
+         get_focus_area({message_type: "stream", stream_name: "fun", stream_id: 4}),
+         "input#stream_message_recipient_topic",
+     );
+-    override(realm, "realm_mandatory_topics", false);
++    override(realm, "realm_topics_policy", "allow_empty_topic");
+     assert.equal(
+         get_focus_area({message_type: "stream", stream_name: "fun", stream_id: 4}),
+         "textarea#compose-textarea",
+diff --git a/web/tests/compose_validate.test.cjs b/web/tests/compose_validate.test.cjs
+index 4ba895a31b..ecd43c2355 100644
+--- a/web/tests/compose_validate.test.cjs
++++ b/web/tests/compose_validate.test.cjs
+@@ -343,7 +343,7 @@ test_ui("validate", ({mock_template, override}) => {
+     };
+     stream_data.add_sub(denmark);
+     compose_state.set_stream_id(denmark.stream_id);
+-    override(realm, "realm_mandatory_topics", true);
++    override(realm, "realm_topics_policy", "disable_empty_topic");
+     let missing_topic_error_rendered = false;
+     mock_template("compose_banner/compose_banner.hbs", false, (data) => {
+         assert.equal(data.classname, compose_banner.CLASSNAMES.topic_missing);
+@@ -405,7 +405,7 @@ test_ui("validate_stream_message", ({override, override_rewire, mock_template})
+     // of execution should not be changed.
+     mock_banners();
+     override(current_user, "user_id", me.user_id);
+-    override(realm, "realm_mandatory_topics", false);
++    override(realm, "realm_topics_policy", "allow_empty_topic");
+ 
+     const special_sub = {
+         stream_id: 101,
+diff --git a/web/tests/dispatch.test.cjs b/web/tests/dispatch.test.cjs
+index c86d491e8c..9da830ca32 100644
+--- a/web/tests/dispatch.test.cjs
++++ b/web/tests/dispatch.test.cjs
+@@ -518,7 +518,7 @@ run_test("realm settings", ({override}) => {
+     override(gear_menu, "rerender", noop);
+     override(narrow_title, "redraw_title", noop);
+     override(navbar_alerts, "toggle_organization_profile_incomplete_banner", noop);
+-    override(compose_recipient, "update_topic_inputbox_on_mandatory_topics_change", noop);
++    override(compose_recipient, "update_topic_inputbox_on_topics_policy_change", noop);
+     override(compose_recipient, "update_compose_area_placeholder_text", noop);
+     override(compose_recipient, "check_posting_policy_for_compose_box", noop);
+ 
+@@ -556,9 +556,6 @@ run_test("realm settings", ({override}) => {
+     });
+     assert_same(realm.realm_name, "new_realm_name");
+ 
+-    event = event_fixtures.realm__update__mandatory_topics;
+-    test_realm_boolean(event, "realm_mandatory_topics");
+-
+     event = event_fixtures.realm__update__org_type;
+     dispatch(event);
+     assert_same(realm.realm_org_type, 50);
+@@ -617,6 +614,7 @@ run_test("realm settings", ({override}) => {
+     override(realm, "realm_can_move_messages_between_topics_group", 1);
+     override(realm, "realm_can_move_messages_between_topics_group", 5);
+     override(realm, "realm_direct_message_permission_group", 1);
++    override(realm, "realm_topics_policy", "allow_empty_topic");
+     override(realm, "realm_plan_type", 2);
+     override(realm, "realm_upload_quota_mib", 5000);
+     override(realm, "max_file_upload_size_mib", 10);
+@@ -655,6 +653,7 @@ run_test("realm settings", ({override}) => {
+     assert_same(realm.realm_can_move_messages_between_topics_group, 3);
+     assert_same(realm.realm_can_resolve_topics_group, 1);
+     assert_same(realm.realm_direct_message_permission_group, 3);
++    assert_same(realm.realm_topics_policy, "disable_empty_topic");
+     assert_same(realm.realm_plan_type, 3);
+     assert_same(realm.realm_upload_quota_mib, 50000);
+     assert_same(realm.max_file_upload_size_mib, 1024);
+diff --git a/web/tests/drafts.test.cjs b/web/tests/drafts.test.cjs
+index 6a68262371..a1d501237c 100644
+--- a/web/tests/drafts.test.cjs
++++ b/web/tests/drafts.test.cjs
+@@ -630,7 +630,7 @@ test("format_drafts", ({override, override_rewire, mock_template}) => {
+     ls.set("drafts", data);
+     assert.deepEqual(draft_model.get(), data);
+ 
+-    override(realm, "realm_mandatory_topics", true);
++    override(realm, "realm_topics_policy", "disable_empty_topic");
+     expected[5].topic_display_name = "";
+     expected[5].is_empty_string_topic = false;
+     assert.deepEqual(draft_model.get(), data);
+diff --git a/web/tests/lib/events.cjs b/web/tests/lib/events.cjs
+index 987ab05268..aa68942390 100644
+--- a/web/tests/lib/events.cjs
++++ b/web/tests/lib/events.cjs
+@@ -361,13 +361,6 @@ exports.fixtures = {
+         value: false,
+     },
+ 
+-    realm__update__mandatory_topics: {
+-        type: "realm",
+-        op: "update",
+-        property: "mandatory_topics",
+-        value: false,
+-    },
+-
+     realm__update__name: {
+         type: "realm",
+         op: "update",
+@@ -432,6 +425,7 @@ exports.fixtures = {
+             plan_type: 3,
+             upload_quota_mib: 50000,
+             max_file_upload_size_mib: 1024,
++            topics_policy: "disable_empty_topic",
+         },
+     },
+ 
+diff --git a/web/tests/message_view.test.cjs b/web/tests/message_view.test.cjs
+index af18ce45bb..c697194d25 100644
+--- a/web/tests/message_view.test.cjs
++++ b/web/tests/message_view.test.cjs
+@@ -824,16 +824,16 @@ run_test("narrow_to_compose_target streams", ({override, override_rewire}) => {
+         {operator: "topic", operand: "four"},
+     ]);
+ 
+-    // Test with blank topic, with realm_mandatory_topics
+-    override(realm, "realm_mandatory_topics", true);
++    // Test with blank topic, with realm_topics_policy
++    override(realm, "realm_topics_policy", "disable_empty_topic");
+     compose_state.topic("");
+     args.called = false;
+     message_view.to_compose_target();
+     assert.equal(args.called, true);
+     assert.deepEqual(args.terms, [{operator: "channel", operand: rome_id.toString()}]);
+ 
+-    // Test with blank topic, without realm_mandatory_topics
+-    override(realm, "realm_mandatory_topics", false);
++    // Test with blank topic, without realm_topics_policy
++    override(realm, "realm_topics_policy", "allow_empty_topic");
+     compose_state.topic("");
+     args.called = false;
+     message_view.to_compose_target();
+@@ -844,7 +844,7 @@ run_test("narrow_to_compose_target streams", ({override, override_rewire}) => {
+     ]);
+ 
+     // Test with no topic, with realm mandatory topics
+-    override(realm, "realm_mandatory_topics", true);
++    override(realm, "realm_topics_policy", "disable_empty_topic");
+     compose_state.topic(undefined);
+     args.called = false;
+     message_view.to_compose_target();
+@@ -852,7 +852,7 @@ run_test("narrow_to_compose_target streams", ({override, override_rewire}) => {
+     assert.deepEqual(args.terms, [{operator: "channel", operand: rome_id.toString()}]);
+ 
+     // Test with no topic, without realm mandatory topics
+-    override(realm, "realm_mandatory_topics", false);
++    override(realm, "realm_topics_policy", "allow_empty_topic");
+     compose_state.topic(undefined);
+     args.called = false;
+     message_view.to_compose_target();
+diff --git a/web/tests/typing_status.test.cjs b/web/tests/typing_status.test.cjs
+index 6b9c3309a2..11536a7e52 100644
+--- a/web/tests/typing_status.test.cjs
++++ b/web/tests/typing_status.test.cjs
+@@ -33,7 +33,7 @@ function returns_time(secs) {
+ }
+ 
+ run_test("basics", ({override, override_rewire}) => {
+-    override(realm, "realm_mandatory_topics", true);
++    override(realm, "realm_topics_policy", "disable_empty_topic");
+     override(realm, "server_typing_started_wait_period_milliseconds", TYPING_STARTED_WAIT_PERIOD);
+     override(realm, "server_typing_stopped_wait_period_milliseconds", TYPING_STOPPED_WAIT_PERIOD);
+ 

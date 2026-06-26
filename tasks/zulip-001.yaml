@@ -1,0 +1,124 @@
+id: zulip-001
+title: "Add topics_policy realm setting (deprecating mandatory_topics)"
+source_pr: "https://github.com/zulip/zulip/pull/34897"
+tracking_issue: "https://github.com/zulip/zulip/issues/33549"
+source_commit: "62c67eae8ecd1f4cf954fc483f8c575eae3e7c45"
+parent_commit: "8fb1eeeb0985173d81806a944d87327c850082ca"
+merged_date: "2025-06-17"            # post knowledge-cutoff (May 2025) — contamination-controlled
+repo: zulip
+language: python
+type: T1                              # distributed invariant propagation
+tier: hard
+
+# Repo scale (proves retrieval pressure): 416K LOC Python total, 345K in zerver/ backend.
+# Full load infeasible within 1M-token budget — agent must triage.
+
+description: |
+  Zulip realms currently have a boolean `mandatory_topics` setting that, when
+  enabled, requires every stream message to have a non-empty topic.
+
+  Replace this with a more expressive `topics_policy` realm setting and
+  deprecate `mandatory_topics`.
+
+  Requirements:
+  - Add a `topics_policy` setting on the realm with these allowed values
+    (enum `RealmTopicsPolicyEnum`): `allow_empty_topic`, `disable_empty_topic`.
+    (The PR's gold tests pin these names — see note below.)
+  - When the policy is `disable_empty_topic`, sending or moving a message into
+    an empty topic must fail with "Topics are required in this organization"
+    (preserve the existing mandatory_topics enforcement behavior under the new
+    setting).
+  - The setting must be settable via `PATCH /json/realm` and validated
+    (invalid values return "Invalid topics_policy").
+  - The setting must be included in the realm state delivered to clients and
+    propagate via the realm-update event system (event schema + event types +
+    events.py state).
+  - Deprecate `mandatory_topics`: remove the old field after migrating its
+    value into the new setting.
+  - Provide database migrations: add the field, backfill default from existing
+    `mandatory_topics`, finalize, then remove the old field.
+
+  Scope: BACKEND ONLY. Do not modify `web/` frontend code. The task is judged
+  on backend correctness and event propagation.
+
+# --- Methodology note (NOT shown to agent) ---
+# The gold tests are partly MODIFICATIONS of existing tests that switch from the
+# old `mandatory_topics` boolean API to `topics_policy` + RealmTopicsPolicyEnum.
+# Because gold tests pin the gold implementation's public names, the task prompt
+# deliberately specifies the setting name and enum members. The fat-context skill
+# under measurement is NOT "invent an API" — it is "propagate a known concept
+# consistently across model/migration/actions/events/views/enforcement without
+# dropping a layer." Missing the event-system registration fails test_events.py
+# even if the model + view are correct. That is the partial-knowledge penalty.
+
+# --- Gold patch (real merged diff), backend only ---
+gold_patch_files:
+  - zerver/models/realms.py
+  - zerver/actions/realm_settings.py
+  - zerver/actions/message_send.py
+  - zerver/actions/message_edit.py
+  - zerver/lib/events.py
+  - zerver/lib/event_schema.py
+  - zerver/lib/event_types.py
+  - zerver/views/realm.py
+  - zerver/openapi/zulip.yaml
+  - zerver/migrations/0710_realm_topics_policy.py
+  - zerver/migrations/0711_set_default_value_for_realm_topics_policy.py
+  - zerver/migrations/0712_alter_realm_topics_policy.py
+  - zerver/migrations/0713_remove_realm_mandatory_topics.py
+
+# Migration filenames are gold-specific; completeness scoring matches on the
+# non-migration files + "added >=1 migration" rather than exact migration names.
+
+# --- Gate tests (the tests the PR added/changed; applied from gold, run vs agent impl) ---
+gold_test_files:
+  - zerver/tests/test_realm.py
+  - zerver/tests/test_message_send.py
+  - zerver/tests/test_message_move_topic.py
+  - zerver/tests/test_events.py
+  - zerver/tests/test_home.py
+
+gate_tests:
+  - "zerver/tests/test_realm.py::RealmAPITest::test_invalid_topics_policy"
+  - "zerver/tests/test_message_send.py::CheckMessageTest"      # empty-topic enforcement
+  - "zerver/tests/test_message_move_topic.py"                  # move into empty topic
+  - "zerver/tests/test_events.py"                              # event propagation of setting
+  # exact node ids finalized in build Step 4 after running gold
+
+regression_command: |
+  # Scoped backend regression — realm + message paths most likely to be affected
+  ./tools/test-backend zerver.tests.test_realm zerver.tests.test_message_send \
+    zerver.tests.test_message_edit zerver.tests.test_message_move_topic
+
+token_budget: 1200000
+wall_clock_cap_seconds: 2700
+
+# --- Documented at selection time, NOT shown to agent ---
+minimum_reading_set:
+  - zerver/models/realms.py                 # where realm settings + enums live; mandatory_topics field
+  - zerver/actions/realm_settings.py        # do_set_realm_property + property registry
+  - zerver/actions/message_send.py          # empty-topic enforcement on send
+  - zerver/actions/message_edit.py          # empty-topic enforcement on move/edit
+  - zerver/lib/events.py                     # realm state assembly for clients
+  - zerver/lib/event_schema.py               # event validation schema
+  - zerver/lib/event_types.py                # typed event definitions
+  - zerver/views/realm.py                    # PATCH /json/realm endpoint + validation
+  - zerver/lib/message.py                    # (context) empty-topic helpers
+  - zerver/lib/topic.py                      # (context) topic constants/helpers
+  - "an existing recent migration"           # numbering/structure convention
+  - "an existing enum-backed realm setting"  # pattern to mirror (e.g. *_policy settings)
+
+red_herrings:
+  - web/src/settings_config.ts               # frontend setting config — out of scope
+  - web/src/server_events_dispatch.js        # frontend event handling — out of scope
+  - zerver/lib/streams.py                    # stream settings, similar shape, unrelated
+  - zerver/models/streams.py                 # stream-level policies look similar
+
+attributes:
+  scatter: high          # model/actions/events/views/migrations across 6+ dirs
+  snr: low               # ~12 relevant files among ~hundreds of zerver/*.py
+  red_herrings: medium   # many *_policy settings + stream settings look adjacent
+  inferential_distance: short   # behavior specified; "how/where" must be discovered
+  ambiguity: medium      # must infer the enum-setting pattern + event registration
+  coupling: deep         # setting → enforcement → event sync → API; transitive
+  spec: under            # outcome specified, implementation surface not

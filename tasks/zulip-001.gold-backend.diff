@@ -1,0 +1,405 @@
+commit 62c67eae8ecd1f4cf954fc483f8c575eae3e7c45
+Author: Kunal Sharma <v.shm.kunal@gmail.com>
+Date:   Sat Jun 14 11:19:57 2025 +0000
+
+    settings: Add a new `topics_policy` realm setting.
+    
+    Added a new realm setting, `topics_policy` and deprecated
+    `mandatory_topics` setting as it now replaced by `topics_policy`.
+    
+    Fixes part of #33549.
+
+diff --git a/zerver/actions/message_edit.py b/zerver/actions/message_edit.py
+index 231592f41a..ab0121f2fd 100644
+--- a/zerver/actions/message_edit.py
++++ b/zerver/actions/message_edit.py
+@@ -90,6 +90,7 @@ from zerver.models import (
+     UserProfile,
+     UserTopic,
+ )
++from zerver.models.realms import RealmTopicsPolicyEnum
+ from zerver.models.streams import get_stream_by_id_in_realm
+ from zerver.models.users import ResolvedTopicNoticeAutoReadPolicyEnum, get_system_bot
+ from zerver.tornado.django_api import send_event_on_commit
+@@ -128,7 +129,10 @@ def validate_message_edit_payload(
+     if propagate_mode != "change_one" and topic_name is None and stream_id is None:
+         raise JsonableError(_("Invalid propagate_mode without topic edit"))
+ 
+-    if message.realm.mandatory_topics and topic_name in ("(no topic)", ""):
++    if (
++        message.realm.topics_policy == RealmTopicsPolicyEnum.disable_empty_topic.value
++        and topic_name in ("(no topic)", "")
++    ):
+         raise JsonableError(_("Topics are required in this organization."))
+ 
+     if topic_name in {
+diff --git a/zerver/actions/message_send.py b/zerver/actions/message_send.py
+index a1b32358b5..de202c2aa7 100644
+--- a/zerver/actions/message_send.py
++++ b/zerver/actions/message_send.py
+@@ -107,6 +107,7 @@ from zerver.models import (
+ )
+ from zerver.models.clients import get_client
+ from zerver.models.groups import SystemGroups, get_realm_system_groups_name_dict
++from zerver.models.realms import RealmTopicsPolicyEnum
+ from zerver.models.recipients import get_direct_message_group_user_ids
+ from zerver.models.scheduled_jobs import NotificationTriggers
+ from zerver.models.streams import (
+@@ -1782,7 +1783,10 @@ def check_message(
+             # else can sneak past the access check.
+             assert sender.bot_type == sender.OUTGOING_WEBHOOK_BOT
+ 
+-        if realm.mandatory_topics and topic_name == "":
++        if (
++            realm.topics_policy == RealmTopicsPolicyEnum.disable_empty_topic.value
++            and topic_name == ""
++        ):
+             raise JsonableError(_("Topics are required in this organization"))
+ 
+     elif addressee.is_private():
+diff --git a/zerver/actions/realm_settings.py b/zerver/actions/realm_settings.py
+index 07b9719f49..40d3015eee 100644
+--- a/zerver/actions/realm_settings.py
++++ b/zerver/actions/realm_settings.py
+@@ -55,6 +55,7 @@ from zerver.models.groups import SystemGroups
+ from zerver.models.realm_audit_logs import AuditLogEventType
+ from zerver.models.realms import (
+     MessageEditHistoryVisibilityPolicyEnum,
++    RealmTopicsPolicyEnum,
+     get_default_max_invites_for_realm_plan_type,
+     get_realm,
+ )
+@@ -112,6 +113,16 @@ def do_set_realm_property(
+             property=name,
+             value=MessageEditHistoryVisibilityPolicyEnum(value).name,
+         )
++    if name == "topics_policy":
++        event = dict(
++            type="realm",
++            op="update_dict",
++            property="default",
++            data={
++                name: RealmTopicsPolicyEnum(value).name,
++                "mandatory_topics": value == RealmTopicsPolicyEnum.disable_empty_topic.value,
++            },
++        )
+ 
+     send_event_on_commit(realm, event, active_user_ids(realm.id))
+ 
+diff --git a/zerver/lib/event_schema.py b/zerver/lib/event_schema.py
+index f04a0c03f1..cdd6ac5440 100644
+--- a/zerver/lib/event_schema.py
++++ b/zerver/lib/event_schema.py
+@@ -118,6 +118,7 @@ from zerver.lib.event_types import (
+     PersonRole,
+     PersonTimezone,
+     PlanTypeData,
++    RealmTopicsPolicyData,
+ )
+ from zerver.lib.topic import ORIG_TOPIC, TOPIC_NAME
+ from zerver.lib.types import UserGroupMembersDict
+@@ -506,6 +507,8 @@ def check_realm_update_dict(
+             sub_type = GroupSettingUpdateData
+         elif "plan_type" in event["data"]:
+             sub_type = PlanTypeData
++        elif "topics_policy" in event["data"]:
++            sub_type = RealmTopicsPolicyData
+         else:
+             raise AssertionError("unhandled fields in data")
+ 
+diff --git a/zerver/lib/event_types.py b/zerver/lib/event_types.py
+index 0686e9df68..97b1c5ecf8 100644
+--- a/zerver/lib/event_types.py
++++ b/zerver/lib/event_types.py
+@@ -557,6 +557,11 @@ class MessageContentEditLimitSecondsData(BaseModel):
+     message_content_edit_limit_seconds: int | None
+ 
+ 
++class RealmTopicsPolicyData(BaseModel):
++    topics_policy: str
++    mandatory_topics: bool
++
++
+ class NightLogoData(BaseModel):
+     night_logo_url: str
+     night_logo_source: str
+diff --git a/zerver/lib/events.py b/zerver/lib/events.py
+index 591633afb0..75d7c87925 100644
+--- a/zerver/lib/events.py
++++ b/zerver/lib/events.py
+@@ -106,6 +106,7 @@ from zerver.models.realm_emoji import get_all_custom_emoji_for_realm
+ from zerver.models.realm_playgrounds import get_realm_playgrounds
+ from zerver.models.realms import (
+     MessageEditHistoryVisibilityPolicyEnum,
++    RealmTopicsPolicyEnum,
+     get_corresponding_policy_value_for_group_setting,
+     get_realm_domains,
+ )
+@@ -593,6 +594,12 @@ def fetch_initial_state_data(
+             ).name
+         )
+ 
++        state["realm_topics_policy"] = RealmTopicsPolicyEnum(realm.topics_policy).name
++
++        state["realm_mandatory_topics"] = (
++            realm.topics_policy == RealmTopicsPolicyEnum.disable_empty_topic.value
++        )
++
+     if want("realm_user_settings_defaults"):
+         realm_user_default = RealmUserDefault.objects.get(realm=realm)
+         state["realm_user_settings_defaults"] = {}
+diff --git a/zerver/migrations/0710_realm_topics_policy.py b/zerver/migrations/0710_realm_topics_policy.py
+new file mode 100644
+index 0000000000..4e89a30ef5
+--- /dev/null
++++ b/zerver/migrations/0710_realm_topics_policy.py
+@@ -0,0 +1,16 @@
++# Generated by Django 5.1.7 on 2025-03-24 09:05
++from django.db import migrations, models
++
++
++class Migration(migrations.Migration):
++    dependencies = [
++        ("zerver", "0709_navigationview"),
++    ]
++
++    operations = [
++        migrations.AddField(
++            model_name="realm",
++            name="topics_policy",
++            field=models.PositiveSmallIntegerField(null=True),
++        ),
++    ]
+diff --git a/zerver/migrations/0711_set_default_value_for_realm_topics_policy.py b/zerver/migrations/0711_set_default_value_for_realm_topics_policy.py
+new file mode 100644
+index 0000000000..f03d9540e4
+--- /dev/null
++++ b/zerver/migrations/0711_set_default_value_for_realm_topics_policy.py
+@@ -0,0 +1,40 @@
++from enum import Enum
++
++from django.db import migrations
++from django.db.backends.base.schema import BaseDatabaseSchemaEditor
++from django.db.migrations.state import StateApps
++
++
++class RealmTopicsPolicyEnum(Enum):
++    allow_empty_topic = 2
++    disable_empty_topic = 3
++
++
++def set_default_value_for_realm_topics_policy(
++    apps: StateApps, schema_editor: BaseDatabaseSchemaEditor
++) -> None:
++    Realm = apps.get_model("zerver", "Realm")
++
++    Realm.objects.filter(topics_policy=None, mandatory_topics=True).update(
++        topics_policy=RealmTopicsPolicyEnum.disable_empty_topic.value
++    )
++
++    Realm.objects.filter(topics_policy=None, mandatory_topics=False).update(
++        topics_policy=RealmTopicsPolicyEnum.allow_empty_topic.value
++    )
++
++
++class Migration(migrations.Migration):
++    atomic = False
++
++    dependencies = [
++        ("zerver", "0710_realm_topics_policy"),
++    ]
++
++    operations = [
++        migrations.RunPython(
++            set_default_value_for_realm_topics_policy,
++            elidable=True,
++            reverse_code=migrations.RunPython.noop,
++        )
++    ]
+diff --git a/zerver/migrations/0712_alter_realm_topics_policy.py b/zerver/migrations/0712_alter_realm_topics_policy.py
+new file mode 100644
+index 0000000000..b5fb169c03
+--- /dev/null
++++ b/zerver/migrations/0712_alter_realm_topics_policy.py
+@@ -0,0 +1,25 @@
++# Generated by Django 5.1.7 on 2025-03-24 09:11
++
++from enum import Enum
++
++from django.db import migrations, models
++
++
++class RealmTopicsPolicyEnum(Enum):
++    allow_empty_topic = 2
++
++
++class Migration(migrations.Migration):
++    dependencies = [
++        ("zerver", "0711_set_default_value_for_realm_topics_policy"),
++    ]
++
++    operations = [
++        migrations.AlterField(
++            model_name="realm",
++            name="topics_policy",
++            field=models.PositiveSmallIntegerField(
++                default=RealmTopicsPolicyEnum.allow_empty_topic.value
++            ),
++        ),
++    ]
+diff --git a/zerver/migrations/0713_remove_realm_mandatory_topics.py b/zerver/migrations/0713_remove_realm_mandatory_topics.py
+new file mode 100644
+index 0000000000..db660153be
+--- /dev/null
++++ b/zerver/migrations/0713_remove_realm_mandatory_topics.py
+@@ -0,0 +1,16 @@
++# Generated by Django 5.1.7 on 2025-03-24 09:18
++
++from django.db import migrations
++
++
++class Migration(migrations.Migration):
++    dependencies = [
++        ("zerver", "0712_alter_realm_topics_policy"),
++    ]
++
++    operations = [
++        migrations.RemoveField(
++            model_name="realm",
++            name="mandatory_topics",
++        ),
++    ]
+diff --git a/zerver/models/realms.py b/zerver/models/realms.py
+index 8e637b3a1b..9a088c7eac 100644
+--- a/zerver/models/realms.py
++++ b/zerver/models/realms.py
+@@ -155,6 +155,11 @@ class MessageEditHistoryVisibilityPolicyEnum(Enum):
+     none = 3
+ 
+ 
++class RealmTopicsPolicyEnum(Enum):
++    allow_empty_topic = 2
++    disable_empty_topic = 3
++
++
+ class Realm(models.Model):
+     MAX_REALM_NAME_LENGTH = 40
+     MAX_REALM_DESCRIPTION_LENGTH = 1000
+@@ -223,7 +228,10 @@ class Realm(models.Model):
+     send_welcome_emails = models.BooleanField(default=True)
+     message_content_allowed_in_email_notifications = models.BooleanField(default=True)
+ 
+-    mandatory_topics = models.BooleanField(default=False)
++    topics_policy = models.PositiveSmallIntegerField(
++        default=RealmTopicsPolicyEnum.allow_empty_topic.value
++    )
++    REALM_TOPICS_POLICY_TYPES = list(RealmTopicsPolicyEnum)
+ 
+     require_unique_names = models.BooleanField(default=False)
+     name_changes_disabled = models.BooleanField(default=False)
+@@ -698,7 +706,6 @@ class Realm(models.Model):
+         inline_url_embed_preview=bool,
+         invite_required=bool,
+         jitsi_server_url=str | None,
+-        mandatory_topics=bool,
+         message_content_allowed_in_email_notifications=bool,
+         message_content_edit_limit_seconds=int | None,
+         message_content_delete_limit_seconds=int | None,
+@@ -711,6 +718,7 @@ class Realm(models.Model):
+         push_notifications_enabled=bool,
+         require_unique_names=bool,
+         send_welcome_emails=bool,
++        topics_policy=RealmTopicsPolicyEnum,
+         video_chat_provider=int,
+         waiting_period_threshold=int,
+         want_advertise_in_communities_directory=bool,
+diff --git a/zerver/openapi/zulip.yaml b/zerver/openapi/zulip.yaml
+index e80d5b637e..78ce7607b7 100644
+--- a/zerver/openapi/zulip.yaml
++++ b/zerver/openapi/zulip.yaml
+@@ -5069,8 +5069,25 @@ paths:
+                                         [organization profile](/help/create-your-organization-profile).
+                                     mandatory_topics:
+                                       type: boolean
++                                      deprecated: true
+                                       description: |
+                                         Whether [topics are required](/help/require-topics) for messages in this organization.
++
++                                        **Changes**: Deprecated in Zulip 10.0 (feature level ZF-d9265f). This configuration is
++                                        now controlled by `topics_policy` realm setting.
++                                    topics_policy:
++                                      type: string
++                                      enum:
++                                        - allow_empty_topic
++                                        - disable_empty_topic
++                                      description: |
++                                        Configuration defining the default policy for sending messages in empty topics.
++
++                                        - allow_empty_topic - Topics are not required to send messages in the channels.
++                                        - disable_empty_topic - Topics are required to send messages in the channels.
++
++                                        **Changes**: New in Zulip 10.0 (feature level ZF-d9265f). Previously, this configuration was
++                                        controlled by a boolean realm setting, `mandatory_topics`.
+                                     max_file_upload_size_mib:
+                                       type: integer
+                                       description: |
+@@ -18197,10 +18214,29 @@ paths:
+                           [previews of linked websites](/help/image-video-and-website-previews).
+                       realm_mandatory_topics:
+                         type: boolean
++                        deprecated: true
+                         description: |
+                           Present if `realm` is present in `fetch_event_types`.
+ 
+                           Whether [topics are required](/help/require-topics) for messages in this organization.
++
++                          **Changes**: Deprecated in Zulip 10.0 (feature level ZF-d9265f). This configuration is
++                          now controlled by `topics_policy` realm setting.
++                      realm_topics_policy:
++                        type: string
++                        enum:
++                          - allow_empty_topic
++                          - disable_empty_topic
++                        description: |
++                          Present if `realm` is present in `fetch_event_types`.
++
++                          Configuration defining the default policy for sending messages in empty topics.
++
++                          - allow_empty_topic - Topics are not required to send messages in the channels.
++                          - disable_empty_topic - Topics are required to send messages in the channels.
++
++                          **Changes**: New in Zulip 10.0 (feature level ZF-d9265f). Previously, this configuration was
++                          controlled by a boolean realm setting, `mandatory_topics`.
+                       realm_message_retention_days:
+                         type: integer
+                         description: |
+diff --git a/zerver/views/realm.py b/zerver/views/realm.py
+index 4f2eb51348..c43694fe84 100644
+--- a/zerver/views/realm.py
++++ b/zerver/views/realm.py
+@@ -57,6 +57,7 @@ from zerver.models.realms import (
+     DigestWeekdayEnum,
+     MessageEditHistoryVisibilityPolicyEnum,
+     OrgTypeEnum,
++    RealmTopicsPolicyEnum,
+ )
+ from zerver.models.users import ResolvedTopicNoticeAutoReadPolicyEnum
+ from zerver.views.user_settings import check_settings_values
+@@ -115,7 +116,16 @@ def update_realm(
+         ApiParamConfig("message_content_delete_limit_seconds"),
+     ] = None,
+     allow_message_editing: Json[bool] | None = None,
+-    mandatory_topics: Json[bool] | None = None,
++    topics_policy: Annotated[
++        str | None,
++        AfterValidator(
++            lambda val: parse_enum_from_string_value(
++                val,
++                "topics_policy",
++                RealmTopicsPolicyEnum,
++            )
++        ),
++    ] = None,
+     message_content_edit_limit_seconds_raw: Annotated[
+         Json[int | str] | None, ApiParamConfig("message_content_edit_limit_seconds")
+     ] = None,

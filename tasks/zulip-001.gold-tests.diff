@@ -1,0 +1,167 @@
+commit 62c67eae8ecd1f4cf954fc483f8c575eae3e7c45
+Author: Kunal Sharma <v.shm.kunal@gmail.com>
+Date:   Sat Jun 14 11:19:57 2025 +0000
+
+    settings: Add a new `topics_policy` realm setting.
+    
+    Added a new realm setting, `topics_policy` and deprecated
+    `mandatory_topics` setting as it now replaced by `topics_policy`.
+    
+    Fixes part of #33549.
+
+diff --git a/zerver/tests/test_events.py b/zerver/tests/test_events.py
+index fed0dcc4b6..7081521be1 100644
+--- a/zerver/tests/test_events.py
++++ b/zerver/tests/test_events.py
+@@ -4259,6 +4259,7 @@ class RealmPropertyActionTest(BaseAction):
+             message_content_edit_limit_seconds=[1000, 1100, 1200, None],
+             move_messages_within_stream_limit_seconds=[1000, 1100, 1200, None],
+             move_messages_between_streams_limit_seconds=[1000, 1100, 1200, None],
++            topics_policy=Realm.REALM_TOPICS_POLICY_TYPES,
+         )
+ 
+         vals = test_values.get(name)
+@@ -4326,6 +4327,7 @@ class RealmPropertyActionTest(BaseAction):
+             if name in [
+                 "allow_message_editing",
+                 "message_content_edit_limit_seconds",
++                "topics_policy",
+             ]:
+                 check_realm_update_dict("events[0]", events[0])
+             else:
+diff --git a/zerver/tests/test_home.py b/zerver/tests/test_home.py
+index 310fd67c07..9f431f299b 100644
+--- a/zerver/tests/test_home.py
++++ b/zerver/tests/test_home.py
+@@ -207,6 +207,7 @@ class HomeTest(ZulipTestCase):
+         "realm_require_unique_names",
+         "realm_send_welcome_emails",
+         "realm_signup_announcements_stream_id",
++        "realm_topics_policy",
+         "realm_upload_quota_mib",
+         "realm_uri",
+         "realm_url",
+diff --git a/zerver/tests/test_message_move_topic.py b/zerver/tests/test_message_move_topic.py
+index 0342ea3221..e0d0798ecd 100644
+--- a/zerver/tests/test_message_move_topic.py
++++ b/zerver/tests/test_message_move_topic.py
+@@ -36,6 +36,7 @@ from zerver.lib.utils import assert_is_not_none
+ from zerver.models import Message, UserMessage, UserProfile, UserTopic
+ from zerver.models.constants import MAX_TOPIC_NAME_LENGTH
+ from zerver.models.groups import NamedUserGroup, SystemGroups
++from zerver.models.realms import RealmTopicsPolicyEnum
+ from zerver.models.streams import Stream
+ from zerver.models.users import ResolvedTopicNoticeAutoReadPolicyEnum
+ 
+@@ -133,10 +134,15 @@ class MessageMoveTopicTest(ZulipTestCase):
+             topic_name=original_topic_name,
+         )
+ 
+-        # Verify with mandatory_topics=True:
++        # Verify with topics_policy=disable_empty_topic:
+         # * A topic can't be moved to an empty topic
+         # * A topic can be moved to a non-empty topic
+-        do_set_realm_property(realm, "mandatory_topics", True, acting_user=admin_user)
++        do_set_realm_property(
++            realm,
++            "topics_policy",
++            RealmTopicsPolicyEnum.disable_empty_topic,
++            acting_user=admin_user,
++        )
+ 
+         for topic_name in ["(no topic)", ""]:
+             result = self.client_patch(
+@@ -158,10 +164,12 @@ class MessageMoveTopicTest(ZulipTestCase):
+         self.assert_json_success(result)
+         self.check_topic(message_id, new_topic_name)
+ 
+-        # Verify with mandatory_topics=False:
++        # Verify with topics_policy=allow_empty_topic:
+         # * A topic can be moved to an empty topic
+         # * A topic can be moved to a non-empty topic
+-        do_set_realm_property(realm, "mandatory_topics", False, acting_user=admin_user)
++        do_set_realm_property(
++            realm, "topics_policy", RealmTopicsPolicyEnum.allow_empty_topic, acting_user=admin_user
++        )
+ 
+         for topic_name in ["(no topic)", "", "non-empty topic"]:
+             result = self.client_patch(
+diff --git a/zerver/tests/test_message_send.py b/zerver/tests/test_message_send.py
+index 917600f8ee..72b3b9e04e 100644
+--- a/zerver/tests/test_message_send.py
++++ b/zerver/tests/test_message_send.py
+@@ -74,7 +74,7 @@ from zerver.models import (
+ )
+ from zerver.models.constants import MAX_TOPIC_NAME_LENGTH
+ from zerver.models.groups import SystemGroups
+-from zerver.models.realms import get_realm
++from zerver.models.realms import RealmTopicsPolicyEnum, get_realm
+ from zerver.models.recipients import get_direct_message_group, get_or_create_direct_message_group
+ from zerver.models.streams import get_stream
+ from zerver.models.users import get_system_bot, get_user
+@@ -3563,13 +3563,17 @@ class CheckMessageTest(ZulipTestCase):
+         message_content = "whatever"
+         addressee = Addressee.for_stream(stream, topic_name)
+ 
+-        do_set_realm_property(realm, "mandatory_topics", True, acting_user=None)
++        do_set_realm_property(
++            realm, "topics_policy", RealmTopicsPolicyEnum.disable_empty_topic, acting_user=None
++        )
+         realm.refresh_from_db()
+ 
+         with self.assertRaisesRegex(JsonableError, "Topics are required in this organization"):
+             check_message(sender, client, addressee, message_content, realm)
+ 
+-        do_set_realm_property(realm, "mandatory_topics", False, acting_user=None)
++        do_set_realm_property(
++            realm, "topics_policy", RealmTopicsPolicyEnum.allow_empty_topic, acting_user=None
++        )
+         realm.refresh_from_db()
+         ret = check_message(sender, client, addressee, message_content, realm)
+         self.assertEqual(ret.message.sender.id, sender.id)
+@@ -3583,13 +3587,17 @@ class CheckMessageTest(ZulipTestCase):
+         message_content = "whatever"
+         addressee = Addressee.for_stream(stream, topic_name)
+ 
+-        do_set_realm_property(realm, "mandatory_topics", True, acting_user=None)
++        do_set_realm_property(
++            realm, "topics_policy", RealmTopicsPolicyEnum.disable_empty_topic, acting_user=None
++        )
+         realm.refresh_from_db()
+ 
+         with self.assertRaisesRegex(JsonableError, "Topics are required in this organization"):
+             check_message(sender, client, addressee, message_content, realm)
+ 
+-        do_set_realm_property(realm, "mandatory_topics", False, acting_user=None)
++        do_set_realm_property(
++            realm, "topics_policy", RealmTopicsPolicyEnum.allow_empty_topic, acting_user=None
++        )
+         realm.refresh_from_db()
+         ret = check_message(sender, client, addressee, message_content, realm)
+         self.assertEqual(ret.message.topic_name(), topic_name)
+diff --git a/zerver/tests/test_realm.py b/zerver/tests/test_realm.py
+index d2f8a2379a..5425b4bb49 100644
+--- a/zerver/tests/test_realm.py
++++ b/zerver/tests/test_realm.py
+@@ -2057,6 +2057,7 @@ class RealmAPITest(ZulipTestCase):
+             message_content_edit_limit_seconds=[1000, 1100, 1200],
+             move_messages_within_stream_limit_seconds=[1000, 1100, 1200],
+             move_messages_between_streams_limit_seconds=[1000, 1100, 1200],
++            topics_policy=Realm.REALM_TOPICS_POLICY_TYPES,
+         )
+ 
+         vals = test_values.get(name)
+@@ -2441,6 +2442,13 @@ class RealmAPITest(ZulipTestCase):
+         )
+         self.assert_json_error(result, "Invalid message_edit_history_visibility_policy")
+ 
++    def test_invalid_topics_policy(self) -> None:
++        result = self.client_patch(
++            "/json/realm",
++            {"topics_policy": "invalid"},
++        )
++        self.assert_json_error(result, "Invalid topics_policy")
++
+     def update_with_realm_default_api(self, name: str, val: Any) -> None:
+         if not isinstance(val, str):
+             val = orjson.dumps(val).decode()
