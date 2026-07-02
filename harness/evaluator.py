@@ -13,7 +13,14 @@ that behind the `Evaluator` interface so the rest of the pipeline runs anywhere.
 
 `run_tests` returns gate results. test ids may be pytest node-ids
 (`zerver/tests/test_realm.py::Cls::test_x`) from the task YAML; we translate to test-backend's
-dotted module paths (`zerver.tests.test_realm.Cls.test_x`).
+dotted paths.
+
+IMPORTANT (validated on a real Zulip container, 2026-07-01): test-backend's Django test loader
+accepts only MODULE (`zerver.tests.test_realm`) or CLASS (`zerver.tests.test_realm.Cls`) labels.
+A method-level dotted label (`...Cls.test_x`) is fed raw to `__import__` and dies with
+"is not a package". So we collapse any method component down to the class — the finest
+granularity test-backend can actually run. Gate node ids should be pinned at class or module
+level in task YAML; a method-level id runs its whole class (a strict superset, still a valid gate).
 """
 
 from __future__ import annotations
@@ -39,20 +46,32 @@ class TestRunResult:
 
 
 def nodeid_to_dotted(test_id: str) -> str:
-    """`zerver/tests/test_realm.py::Cls::test_x` -> `zerver.tests.test_realm.Cls.test_x`.
+    """Translate a task-YAML test id to a label test-backend can actually run.
 
-    Already-dotted ids (no `::`, no `.py`) pass through unchanged. A bare module path like
-    `zerver/tests/test_events.py` -> `zerver.tests.test_events`.
+    `zerver/tests/test_realm.py::Cls::test_x` -> `zerver.tests.test_realm.Cls`  (class level)
+    `zerver/tests/test_realm.py::Cls`         -> `zerver.tests.test_realm.Cls`
+    `zerver/tests/test_events.py`             -> `zerver.tests.test_events`     (module level)
+
+    test-backend cannot run a single method (see module docstring), so a `::method`
+    component is dropped — the class runs instead. Already-dotted ids pass through, except
+    a trailing `.test_*` method component is likewise stripped to its class.
     """
     test_id = test_id.strip()
     if "::" in test_id:
         file_part, *rest = test_id.split("::")
         mod = file_part.removesuffix(".py").replace("/", ".")
-        return ".".join([mod, *rest])
+        # Keep at most the class component; drop a method component if present.
+        class_part = [rest[0]] if rest else []
+        return ".".join([mod, *class_part])
     if test_id.endswith(".py"):
         return test_id.removesuffix(".py").replace("/", ".")
     if "/" in test_id:
         return test_id.replace("/", ".")
+    # Already dotted. Drop a trailing method component (`.test_foo`) only when it follows a
+    # class component (uppercase-initial), so module names like `...tests.test_realm` survive.
+    parts = test_id.split(".")
+    if (len(parts) > 2 and parts[-1].startswith("test_") and parts[-2][:1].isupper()):
+        return ".".join(parts[:-1])
     return test_id
 
 

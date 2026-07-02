@@ -79,11 +79,17 @@ gold_test_files:
   - zerver/tests/test_home.py
 
 gate_tests:
-  - "zerver/tests/test_realm.py::RealmAPITest::test_invalid_topics_policy"
-  - "zerver/tests/test_message_send.py::CheckMessageTest"      # empty-topic enforcement
-  - "zerver/tests/test_message_move_topic.py"                  # move into empty topic
-  - "zerver/tests/test_events.py"                              # event propagation of setting
-  # exact node ids finalized in build Step 4 after running gold
+  # Finalized in Step 4 (2026-07-01) by running gold on a real Zulip container. Pinned at
+  # CLASS granularity: Zulip's test-backend cannot run a single method (a method-level dotted
+  # label is fed raw to __import__ and dies "is not a package"); only module/class labels run.
+  # Validated: gold-backend + gold-tests -> PASS (98 tests OK across these 5 classes);
+  # gold-tests alone on unpatched parent -> FAIL (ImportError on RealmTopicsPolicyEnum;
+  # class-level: failures=1, errors=34). The harness collapses any method-level id to its class.
+  - "zerver/tests/test_realm.py::RealmAPITest"                 # test_invalid_topics_policy + API set
+  - "zerver/tests/test_message_send.py::CheckMessageTest"      # empty-topic enforcement on send
+  - "zerver/tests/test_message_move_topic.py::MessageMoveTopicTest"  # move into empty topic
+  - "zerver/tests/test_events.py::RealmPropertyActionTest"     # event propagation of the setting
+  - "zerver/tests/test_home.py::HomeTest"                      # setting present in initial state
 
 regression_command: |
   # Scoped backend regression — realm + message paths most likely to be affected

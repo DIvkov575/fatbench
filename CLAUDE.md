@@ -87,29 +87,39 @@ RabbitMQ, memcached, provisioned venv) and **do not run natively on macOS** — 
 Zulip's dev/CI container.
 
 ```bash
-# Inside the Zulip container, from repos/zulip:
+# Inside the Zulip container, from repos/zulip (venv must be active):
 ./tools/test-backend                                  # full backend suite
-./tools/test-backend zerver.tests.test_realm          # one test module (dotted path)
-./tools/test-backend zerver.tests.test_realm.RealmAPITest.test_invalid_topics_policy  # single test
+./tools/test-backend zerver.tests.test_realm          # one test MODULE (dotted path)
+./tools/test-backend zerver.tests.test_realm.RealmAPITest  # one test CLASS (dotted path)
 ```
 
-Note: `test-backend` takes Python **dotted module paths** (`zerver.tests.test_realm`), while
-pytest-style node ids (`zerver/tests/test_realm.py::RealmAPITest::test_x`) appear in task YAML for
-readability — translate accordingly.
+Note: `test-backend` accepts **only MODULE or CLASS** dotted labels — **NOT single methods**
+(validated on a real container, 2026-07-01). A method-level label like
+`zerver.tests.test_realm.RealmAPITest.test_invalid_topics_policy` is fed raw to `__import__`
+and dies with `... is not a package`. Pytest-style node ids
+(`zerver/tests/test_realm.py::RealmAPITest::test_x`) appear in task YAML for readability; the
+harness's `nodeid_to_dotted` translates them and **collapses any method component to its class**
+(the finest granularity test-backend can run — a strict superset of the intended test, still a
+valid gate). Pin `gate_tests` at class or module level.
 
-**Oracle validation (LLD Step 4):** apply gold-backend + gold-tests diffs to the parent commit →
-gate tests must PASS. Apply gold-tests alone to the unpatched parent → gate tests must FAIL (proves
-they gate the feature).
+**Oracle validation (LLD Step 4): DONE ✅ (2026-07-01, see STATUS.md).** Confirmed on a real
+provisioned Zulip stack on the remote Cloud Desktop: gold-backend + gold-tests → gate classes
+PASS (98 tests OK); gold-tests alone on the unpatched parent → FAIL (ImportError on
+`RealmTopicsPolicyEnum`). The methodology holds. A reusable provisioned image
+`fatbench/zulip-provisioned:zulip-001` is snapshotted on the remote so future runs skip the
+~15-min provision.
 
-## Environment blocker (live as of STATUS.md)
+## Test execution environment (RESOLVED — 2026-07-01)
 
-There is **no container runtime on this Mac** — the `docker` CLI is present but there is no daemon
-(no Docker Desktop, colima, or podman). The host is **arm64**; Zulip's CI image (`zulip/ci:bookworm`)
-is **amd64-only**, so it runs emulated (slow). Containerization is an *environment* problem, not a
-design one — task selection and oracle design hold regardless of where tests eventually run. If
-colima + emulation proves too slow/flaky, the documented options are (a) move the build to a
-Linux/cloud-desktop host, or (b) author on macOS and run the eval on Linux later. Fallback repo if
-Zulip's env fights us: `dbt-core` (simpler deps), per `LLD.md` §10.
+Tests run on the **remote Amazon Cloud Desktop** in `~/.rbg.conf`
+(`dev-dsk-divkov-1b-029561b7.us-east-1.amazon.com`, x86_64, docker daemon up). Authoring stays on
+macOS; the eval runs on the remote. The old "no container runtime on this Mac" blocker was purely
+a host artifact — the remote runs the amd64 `zulip/ci:bookworm` natively (no emulation). See
+STATUS.md for the validated operational recipe and the `fatbench/zulip-provisioned:zulip-001`
+snapshot. Two container gotchas: (1) the bind-mount approach fails (host UID ≠ container `github`
+uid 1001) — copy the repo *into* the image and `chown -R github`; (2) the bare container has no
+init system, so start `postgresql/redis-server/rabbitmq-server/memcached` by hand before tests.
+Fallback repo if Zulip's env ever fights us: `dbt-core` (simpler deps), per `LLD.md` §10.
 
 ## Harness (to be built — `LLD.md` §6)
 

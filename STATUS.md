@@ -44,41 +44,62 @@ even with a correct model+view → the partial-knowledge penalty we want.
   .venv/bin/python -m harness.run --task tasks/zulip-001.yaml --config configs/baseline.yaml --no-tests
   ```
 
+### Done (cont.)
+- **Step 4 (validate oracle): DONE ✅ (2026-07-01).** Ran on the remote Amazon Cloud Desktop
+  `dev-dsk-divkov-1b-029561b7.us-east-1.amazon.com` (x86_64, docker daemon up, 8c/15G) — the
+  macOS container blocker was purely a host artifact. Two-sided oracle confirmed against a real,
+  fully-provisioned Zulip stack:
+  1. **PASS side:** gold-backend + gold-tests applied to parent → gate classes run migrations and
+     pass. `Ran 98 tests ... OK` across the 5 gate classes (`RealmAPITest` alone: 20 tests OK).
+  2. **FAIL side:** gold-tests alone on the unpatched parent → `ImportError: cannot import name
+     'RealmTopicsPolicyEnum'` (collection crash, non-zero exit); class-level run reports
+     `FAILED (failures=1, errors=34)`. The tests genuinely gate the feature.
+- **`gate_tests` finalized** at CLASS granularity in `tasks/zulip-001.yaml`.
+- **ContainerEvaluator / parser validated + bug-fixed:**
+  - **Bug found & fixed:** `nodeid_to_dotted` emitted `module.Class.method`, which test-backend
+    CANNOT run — its loader `__import__`s the raw string → "is not a package". Only MODULE and
+    CLASS labels work. Fixed to collapse any method component to its class. `parse_test_backend_output`
+    verified correct against all three real outputs (OK / import-crash / failures+errors).
+  - **CLAUDE.md correction needed:** the "Running Zulip's tests" section claims test-backend takes
+    `zerver.tests.test_realm.RealmAPITest.test_x` (method dotted). It does NOT — method-level fails.
+  - **27 unit tests pass** (was 25; +2 for the real FAIL-side outputs and method-collapse).
+- **Phase 2 speedup — provisioned image snapshotted:** `fatbench/zulip-provisioned:zulip-001`
+  (5.03GB) on the remote. Future runs skip the ~15-min provision: just `git reset --hard parent →
+  apply diff → start services → test-backend`. This is the key throughput lever for scaling tasks.
+
+### Operational recipe (remote, validated)
+```bash
+HOST=dev-dsk-divkov-1b-029561b7.us-east-1.amazon.com   # from ~/.rbg.conf
+# One-time: docker run from the SNAPSHOT (skips provisioning entirely)
+docker run -d --name zfb fatbench/zulip-provisioned:zulip-001 sleep infinity
+# services have no init system in the bare container — start them by hand each container:
+docker exec -u root zfb bash -lc 'for s in postgresql redis-server rabbitmq-server memcached; do service $s start; done'
+# per run: reset -> apply agent/gold diff -> overlay gold tests -> run gate CLASSES
+docker exec zfb bash -lc 'cd /srv/zulip && git reset --hard 8fb1eeeb09 && git clean -fdq \
+  && git apply /tmp/impl.diff && git apply /tmp/gold-tests.diff \
+  && source .venv/bin/activate && ./tools/test-backend zerver.tests.test_realm.RealmAPITest ...'
+```
+
 ## Next steps
-
-- **Step 4 (validate oracle) — STILL BLOCKED on container runtime.** When a Linux/container
-  env exists, run `harness.run` WITHOUT `--no-tests` so `ContainerEvaluator` provisions
-  Zulip and runs the gates. Confirm:
-  1. Gold backend diff + gold test diff applied → gate tests PASS (use `--dry-run` for this).
-  2. Gold tests applied to UNpatched parent → gate tests FAIL (proves they gate the feature).
-  Finalize exact `gate_tests` node ids (some are still module-level, not single tests).
-- **UNVALIDATED CODE:** `ContainerEvaluator` + `parse_test_backend_output` are written to
-  documented test-backend behavior but never run against a real container. Validate before
-  trusting correctness/regression scores.
-- **Step 6 (calibration run):** baseline (no CLAUDE.md) — measure token consumption,
-  where it gets stuck. (`claude -p` invocation path is built but not yet run on a full task.)
+- **Harness gap to close:** `ContainerEvaluator.setup()` does NOT start the service stack (the
+  bare container has no init system). Either add a service-start step to `setup()`, or point the
+  evaluator at the provisioned snapshot image + start services. Also switch its default image to
+  the snapshot to skip provisioning.
+- **CLAUDE.md fix:** correct the test-backend single-test claim (method-level does not run).
+- **Step 6 (calibration run):** baseline (no CLAUDE.md) on the remote — measure token
+  consumption, where the agent gets stuck. `claude -p` path built, not yet run on a full task.
 - **Step 7 (compare):** baseline vs full-harness; results JSON + analysis.
+- **Scaling tasks (the stated goal):** with the oracle proven + snapshot ready, build
+  `harness/author.py` to mechanize task authoring (mine post-cutoff 15-40-file PRs → auto-split
+  test/non-test/frontend diffs → draft prompt). Reuse the same snapshot for every Zulip task.
 
-## Risks live right now
-- **Zulip test env is heavy** (Postgres, Redis, RabbitMQ, provisioning). Step 4 is the
-  real gate on this whole MVP. If provisioning fights us → fallback repo `dbt-core`
-  (simpler deps) noted in LLD §10. Decide within Step 4, don't sink >1 day.
-
-## BLOCKER (2026-06-23, Step 4)
-- **No container runtime on this Mac.** `docker` 29.5.2 is just the Homebrew CLI —
-  no Docker Desktop (`/Applications/Docker.app` absent), no daemon, no colima/podman.
-  Earlier "pull succeeded" was a misread; daemon was never reachable.
-- Zulip backend tests need Linux (PG+Redis+RabbitMQ+memcached+venv); no native macOS support.
-- Host is **arm64**; `zulip/ci:bookworm` is **amd64-only** → will run emulated (slow but works).
-- **Action in progress:** `brew install colima docker` (bg `bxoa8y2rq`). Then:
-  `colima start --arch x86_64 --memory 8 --cpu 4 --disk 60` (x86 emulation for the amd64 image),
-  then run CI image → `tools/ci/setup-backend` → `test-backend`.
-- **Decision point:** if colima + emulated provision is too slow/flaky, options are
-  (a) move this whole build to a Linux/cloud-desktop host, or (b) keep authoring on
-  macOS and run the actual eval on Linux later. Containerization is an environment
-  problem, not a design problem — the task selection + oracle design stand regardless.
+## Risks
+- **SSH/WSSH proxy to the Cloud Desktop is flaky** under long-running output (intermittent EPIPE /
+  banner timeouts). Mitigation: write test output to a file inside the container and read it back;
+  keep individual ssh exec calls short. Not a design risk.
 
 ## Key paths
-- Repo: `/Users/divkov/workplace/fatbench/repos/zulip` (HEAD at clone; checkout `8fb1eeeb09` for task)
-- Task: `/Users/divkov/workplace/fatbench/tasks/zulip-001.yaml`
-- Design: `HLD.md`, `LLD.md`
+- Local repo: `/Users/divkov/workplace/fatbench/repos/zulip` (checkout `8fb1eeeb09` for task)
+- Remote: `/local/home/divkov/fatbench` (instrument), `/local/home/divkov/fatbench/repos/zulip`
+  (Zulip @ parent), container `zfb`, image `fatbench/zulip-provisioned:zulip-001`
+- Task: `tasks/zulip-001.yaml`  ·  Design: `HLD.md`, `LLD.md`

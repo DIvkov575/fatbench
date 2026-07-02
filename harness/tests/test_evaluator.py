@@ -13,12 +13,37 @@ from harness.evaluator import (
 
 
 def test_nodeid_to_dotted():
+    # test-backend cannot run a single method (validated on a real container 2026-07-01),
+    # so a method component collapses to its class.
     assert (nodeid_to_dotted("zerver/tests/test_realm.py::RealmAPITest::test_x")
-            == "zerver.tests.test_realm.RealmAPITest.test_x")
+            == "zerver.tests.test_realm.RealmAPITest")
+    assert (nodeid_to_dotted("zerver/tests/test_realm.py::RealmAPITest")
+            == "zerver.tests.test_realm.RealmAPITest")  # class level unchanged
     assert (nodeid_to_dotted("zerver/tests/test_events.py")
             == "zerver.tests.test_events")
     assert (nodeid_to_dotted("zerver.tests.test_realm")
-            == "zerver.tests.test_realm")  # already dotted, passthrough
+            == "zerver.tests.test_realm")  # already dotted module, passthrough
+    assert (nodeid_to_dotted("zerver.tests.test_realm.RealmAPITest.test_x")
+            == "zerver.tests.test_realm.RealmAPITest")  # dotted method collapses too
+
+
+def test_parse_import_crash_fail_side():
+    # Real FAIL-side output: gold tests applied without impl -> collection ImportError,
+    # no "Ran N" summary, non-zero exit. Must read as not-ok.
+    out = (
+        "Found 20 test(s).\nTraceback (most recent call last):\n"
+        "ImportError: cannot import name 'RealmTopicsPolicyEnum' from 'zerver.models.realms'\n"
+    )
+    r = parse_test_backend_output(out, "", 1)
+    assert r.ran and not r.ok
+
+
+def test_parse_failures_and_errors_combined():
+    # Real FAIL-side (class-level) summary: "FAILED (failures=1, errors=34)" over 20 tests.
+    out = "Ran 20 tests in 8.4s\n\nFAILED (failures=1, errors=34)\n"
+    r = parse_test_backend_output(out, "", 1)
+    assert r.ran and not r.ok
+    assert r.total == 20 and r.failed == 35 and r.passed == 0
 
 
 def test_parse_ok_run():
