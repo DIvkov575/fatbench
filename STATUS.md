@@ -80,18 +80,37 @@ docker exec zfb bash -lc 'cd /srv/zulip && git reset --hard 8fb1eeeb09 && git cl
   && source .venv/bin/activate && ./tools/test-backend zerver.tests.test_realm.RealmAPITest ...'
 ```
 
+### Done (cont.) — 2026-07-06 session
+- **Harness wired to the snapshot + validated E2E through the harness code (not manual):**
+  - `ContainerEvaluator` now targets `fatbench/zulip-provisioned:zulip-001` (no in-run provision);
+    `setup()` starts the 4 services; new `stage()` applies impl diff + overlays gold tests INSIDE
+    the container via diffs (tree never overwritten → provisioned `.venv`/`var/` survive);
+    `run_tests`/`run_command` activate the venv and read output back from a file.
+  - **`RemoteContainerEvaluator`** drives docker over SSH; file writes stream through
+    `docker exec -i 'cat > dest'` (no temp files on the remote). `run.py` gained `--remote-host`.
+  - **E2E validated** (`python -m harness.run --dry-run --remote-host <host>`):
+    PASS side → `correctness=1.0`, **98 gate + 243 regression tests OK**; FAIL side (empty impl +
+    gold tests) → `ok=False`. The full setup→stage→run path works over SSH.
+- **CLAUDE.md test-backend claim corrected** (method-level labels don't run) — done last session.
+- **Task-authoring scaler built: `harness/author.py`** (the stated breadth goal):
+  - `discover` — query merged post-cutoff PRs touching N..M files via `gh api`, ranked by fatness.
+  - `build` — fetch one PR's metadata + `.diff`, split into backend/test/frontend (+migrations),
+    score fatness (file count, dir scatter, has-migration), scan the PR body for solution leakage,
+    and emit a review-ready `tasks/<id>.yaml` + split `.diff` files mirroring zulip-001's layout.
+  - Emitted YAML carries inline reviewer TODOs (scrub leakage, pin gate_tests at class/module,
+    confirm parent). Validated against zulip-001's own PR #34897: correctly reported the FULL PR
+    (27 backend files / 7 dirs / migrations → verdict "fat"; zulip-001 hand-narrowed to 13 via a
+    later parent) and flagged the `topics_policy`/`mandatory_topics` leakage. Emitted YAML parses.
+  - **35 unit tests pass** (was 30; +5 author tests for classify/split/fatness/leakage).
+
 ## Next steps
-- **Harness gap to close:** `ContainerEvaluator.setup()` does NOT start the service stack (the
-  bare container has no init system). Either add a service-start step to `setup()`, or point the
-  evaluator at the provisioned snapshot image + start services. Also switch its default image to
-  the snapshot to skip provisioning.
-- **CLAUDE.md fix:** correct the test-backend single-test claim (method-level does not run).
-- **Step 6 (calibration run):** baseline (no CLAUDE.md) on the remote — measure token
-  consumption, where the agent gets stuck. `claude -p` path built, not yet run on a full task.
+- **Step 6 (calibration run):** baseline (no CLAUDE.md) on the remote — real `claude -p` agent on
+  zulip-001, measure token burn + where it gets stuck. `harness.run` (no `--dry-run`) is ready.
 - **Step 7 (compare):** baseline vs full-harness; results JSON + analysis.
-- **Scaling tasks (the stated goal):** with the oracle proven + snapshot ready, build
-  `harness/author.py` to mechanize task authoring (mine post-cutoff 15-40-file PRs → auto-split
-  test/non-test/frontend diffs → draft prompt). Reuse the same snapshot for every Zulip task.
+- **Grow the task set:** run `author.py discover` on Zulip, `build` 2-3 candidates, review/scrub
+  them into real tasks. Each reuses the same snapshot. Consider a second repo (dbt-core) later.
+- **Author.py polish (optional):** `discover` does one `pulls/<n>` call per candidate (rate-OK but
+  slowish); could batch. Frontend-prefix list is Zulip-specific — parameterize per repo.
 
 ## Risks
 - **SSH/WSSH proxy to the Cloud Desktop is flaky** under long-running output (intermittent EPIPE /
