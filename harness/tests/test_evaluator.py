@@ -101,3 +101,60 @@ def test_detect_runtime_returns_none_or_str():
     # On this host: None. Just assert the contract.
     rt = detect_container_runtime()
     assert rt is None or isinstance(rt, str)
+
+
+import subprocess as _sp
+
+from harness.evaluator import RemoteContainerEvaluator
+
+
+class _FakeProc:
+    def __init__(self, stdout="", stderr="", returncode=0):
+        self.stdout, self.stderr, self.returncode = stdout, stderr, returncode
+
+
+def test_stage_applies_impl_then_gold(monkeypatch):
+    """stage() must reset, apply impl diff, then overlay gold tests — in that order."""
+    calls = []
+    ev = ContainerEvaluator(parent_commit="abc123")
+    ev.runtime = "docker"
+
+    def fake_host_sh(script, stdin=None):
+        calls.append(("sh", script, stdin))
+        return _FakeProc(returncode=0)
+
+    monkeypatch.setattr(ev, "_host_sh", fake_host_sh)
+    ok, msg = ev.stage("IMPL_DIFF", "GOLD_DIFF")
+    assert ok, msg
+    joined = "\n".join(c[1] for c in calls)
+    # reset to parent happens, both diffs are cat'd in and applied
+    assert "git reset --hard abc123" in joined
+    assert "git apply /tmp/impl.diff" in joined
+    assert "git apply /tmp/gold-tests.diff" in joined
+    stdins = [c[2] for c in calls if c[2]]
+    assert "IMPL_DIFF" in stdins and "GOLD_DIFF" in stdins
+
+
+def test_stage_fails_without_parent_commit():
+    ev = ContainerEvaluator()  # no parent_commit
+    ev.runtime = "docker"
+    ok, msg = ev.stage("x", "y")
+    assert not ok and "parent_commit" in msg
+
+
+def test_remote_evaluator_wraps_in_ssh(monkeypatch):
+    """RemoteContainerEvaluator._host_sh must shell out via ssh to the given host."""
+    captured = {}
+
+    def fake_run(argv, input=None, capture_output=None, text=None):
+        captured["argv"] = argv
+        captured["stdin"] = input
+        return _FakeProc(returncode=0)
+
+    monkeypatch.setattr(_sp, "run", fake_run)
+    ev = RemoteContainerEvaluator(host="dev-dsk.example.com")
+    ev._host_sh("docker ps", stdin="data")
+    assert captured["argv"][0] == "ssh"
+    assert "dev-dsk.example.com" in captured["argv"]
+    assert captured["argv"][-1] == "docker ps"
+    assert captured["stdin"] == "data"

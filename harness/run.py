@@ -26,6 +26,7 @@ from .evaluator import (
     ContainerEvaluator,
     Evaluator,
     NullEvaluator,
+    RemoteContainerEvaluator,
     detect_container_runtime,
 )
 from .task import Task, load_task
@@ -42,15 +43,19 @@ def _read_gold_tests_diff(task: Task, tasks_dir: Path) -> str:
     return p.read_text() if p.exists() else ""
 
 
-def pick_evaluator(no_tests: bool, image: str | None) -> Evaluator:
+def pick_evaluator(no_tests: bool, image: str | None, remote_host: str | None,
+                   parent_commit: str | None) -> Evaluator:
     if no_tests:
         return NullEvaluator()
+    if remote_host:
+        return RemoteContainerEvaluator(host=remote_host, image=image,
+                                        parent_commit=parent_commit)
     if detect_container_runtime() is None:
-        print("[harness] no container runtime detected -> NullEvaluator "
-              "(file metrics only). Use a Linux/container host for correctness.",
+        print("[harness] no local container runtime -> NullEvaluator (file metrics only). "
+              "Pass --remote-host <host> to drive docker on a Linux host, or --no-tests.",
               file=sys.stderr)
         return NullEvaluator()
-    return ContainerEvaluator(image=image)
+    return ContainerEvaluator(image=image, parent_commit=parent_commit)
 
 
 def run(
@@ -62,6 +67,7 @@ def run(
     results_root: Path | None = None,
     repo_override: str | None = None,
     image: str | None = None,
+    remote_host: str | None = None,
     keep_workspace: bool = False,
 ) -> dict:
     task = load_task(task_path)
@@ -103,23 +109,25 @@ def run(
         # 4. GRADE ------------------------------------------------------------
         file_metrics = scorer.score_files(agent_paths.impl_paths, task.gold_patch_files)
 
-        evaluator = pick_evaluator(no_tests, image)
-        gate_result = evaluator.run_tests(work.path, task.gate_tests)  # NullEvaluator: ran=False
+        evaluator = pick_evaluator(no_tests, image, remote_host, task.parent_commit)
+        gold_tests_diff = _read_gold_tests_diff(task, tasks_dir)
+        gate_result = NullEvaluator().run_tests(work.path, task.gate_tests)  # ran=False default
         regression_result = None
-        correctness = scorer.score_correctness(
-            gate_result.total, gate_result.passed, gate_result.ran
-        )
-        if gate_result.ran:
+        if not isinstance(evaluator, NullEvaluator):
             try:
                 evaluator.setup(work.path)
-                # Re-run gates inside the provisioned env, then regression.
-                gate_result = _grade_in_env(evaluator, work, task, agent_diff, tasks_dir)
-                correctness = scorer.score_correctness(
-                    gate_result.total, gate_result.passed, gate_result.ran
-                )
+                # Stage inside the (provisioned) env: reset -> agent impl diff -> overlay gold
+                # tests, so the PR's tests — not the agent's — have authority over the gates.
+                staged, msg = evaluator.stage(agent_diff, gold_tests_diff)
+                if not staged:
+                    print(f"[harness] WARNING: staging failed: {msg}", file=sys.stderr)
+                gate_result = evaluator.run_tests(work.path, task.gate_tests)
                 regression_result = evaluator.run_command(work.path, task.regression_command)
             finally:
                 evaluator.teardown()
+        correctness = scorer.score_correctness(
+            gate_result.total, gate_result.passed, gate_result.ran
+        )
         regression = (
             (1.0 if regression_result.ok else 0.0)
             if (regression_result and regression_result.ran) else -1.0
@@ -163,21 +171,6 @@ def run(
             work.cleanup()
 
 
-def _grade_in_env(evaluator, work, task, agent_diff, tasks_dir) -> "object":
-    """Apply agent impl diff + overlay gold tests inside the provisioned env, then run gates.
-
-    NOTE: the workspace already contains the agent's changes (it worked in-place). We only need
-    to overlay the gold test files so the agent's own tests can't pass for it. Applying the gold
-    tests diff on top of the agent's tree gives the PR's tests authority.
-    """
-    gold_tests_diff = _read_gold_tests_diff(task, tasks_dir)
-    if gold_tests_diff.strip():
-        ok, msg = ws_mod.apply_diff(work.path, gold_tests_diff)
-        if not ok:
-            print(f"[harness] WARNING: gold test overlay failed: {msg}", file=sys.stderr)
-    return evaluator.run_tests(work.path, task.gate_tests)
-
-
 def _agent_meta(agent_result) -> dict | None:
     if agent_result is None:
         return None
@@ -206,6 +199,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--results", default=None, help="results root dir (default: ./results)")
     ap.add_argument("--repo", default=None, help="override repo path (default: repos/<task.repo>)")
     ap.add_argument("--image", default=None, help="override container image")
+    ap.add_argument("--remote-host", default=None,
+                    help="drive docker on this host over SSH (e.g. the Cloud Desktop in ~/.rbg.conf)")
     ap.add_argument("--keep-workspace", action="store_true", help="don't delete the temp workspace")
     args = ap.parse_args(argv)
 
@@ -213,7 +208,8 @@ def main(argv: list[str] | None = None) -> int:
         args.task, args.config,
         no_tests=args.no_tests, dry_run=args.dry_run,
         results_root=Path(args.results) if args.results else None,
-        repo_override=args.repo, image=args.image, keep_workspace=args.keep_workspace,
+        repo_override=args.repo, image=args.image, remote_host=args.remote_host,
+        keep_workspace=args.keep_workspace,
     )
     print(json.dumps(summary["scores"], indent=2))
     return 0

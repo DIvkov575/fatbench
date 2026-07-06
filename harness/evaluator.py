@@ -4,12 +4,14 @@ Grading correctness/regression requires running Zulip's backend tests, which nee
 Linux service stack (Postgres/Redis/RabbitMQ/memcached) — container only. This module isolates
 that behind the `Evaluator` interface so the rest of the pipeline runs anywhere.
 
-- ContainerEvaluator: runs `./tools/test-backend` inside Zulip's CI container. BUILT BUT
-  UNVALIDATED — no container runtime exists on the authoring host (see STATUS.md). The
-  test-backend output parser and container wiring are written to documented behavior and must
-  be validated on a Linux env before results are trusted.
+- ContainerEvaluator: runs `./tools/test-backend` inside a PRE-PROVISIONED Zulip container
+  (the `fatbench/zulip-provisioned:zulip-001` snapshot). Validated on a real Zulip stack
+  (2026-07-01). Stages via diffs (reset → apply impl → overlay gold tests) so the provisioned
+  venv/DB survive; starts the service stack by hand (no init system in the container).
+- RemoteContainerEvaluator: same, but drives docker on a remote host over SSH (the docker
+  daemon + snapshot live on the Cloud Desktop; the harness runs on macOS).
 - NullEvaluator: skips execution, returns ran=False. Lets the full pipeline + file metrics run
-  on this host today.
+  on a host with no container runtime.
 
 `run_tests` returns gate results. test ids may be pytest node-ids
 (`zerver/tests/test_realm.py::Cls::test_x`) from the task YAML; we translate to test-backend's
@@ -26,6 +28,7 @@ level in task YAML; a method-level id runs its whole class (a strict superset, s
 from __future__ import annotations
 
 import re
+import shlex
 import shutil
 import subprocess
 from abc import ABC, abstractmethod
@@ -120,6 +123,15 @@ class Evaluator(ABC):
     @abstractmethod
     def setup(self, workspace_path: Path) -> None: ...
 
+    def stage(self, impl_diff: str, gold_tests_diff: str) -> tuple[bool, str]:
+        """Prepare the test environment: reset to parent, apply the agent's impl diff, then
+        overlay the gold test files (so the agent's own tests can't pass for it).
+
+        Default no-op for evaluators that test the local workspace in place. Container
+        evaluators override this to apply the diffs *inside* the provisioned environment.
+        """
+        return True, "no-op (in-place workspace)"
+
     @abstractmethod
     def run_tests(self, workspace_path: Path, test_ids: list[str]) -> TestRunResult: ...
 
@@ -166,62 +178,147 @@ def detect_container_runtime() -> str | None:
 
 
 class ContainerEvaluator(Evaluator):
-    """Run test-backend inside Zulip's CI container.
+    """Run test-backend inside a PRE-PROVISIONED Zulip container.
 
-    UNVALIDATED on the authoring host (no runtime). The high-level flow:
-      setup():     ensure runtime, pull image, start a container with the workspace mounted,
-                   provision the backend (tools/ci/setup-backend) once.
-      run_tests(): `<runtime> exec <cid> ./tools/test-backend <dotted ids...>`
+    Validated on a real Zulip stack (2026-07-01). Assumes an image that already has the venv
+    + service stack installed and `/srv/zulip` checked out at the task's parent commit — i.e.
+    the `fatbench/zulip-provisioned:zulip-001` snapshot, NOT the bare `zulip/ci` image (which
+    would need a ~15-min provision). Flow:
+
+      setup():     start the container, then start the service stack by hand (the bare container
+                   has no init system, so postgres/redis/rabbitmq/memcached don't auto-start).
+      stage():     inside the container: `git reset --hard <parent>` + clean, apply the agent's
+                   impl diff, then overlay the gold test files. We ship diffs (never overwrite
+                   the tree) so the provisioned `.venv`/`var/` survive.
+      run_tests(): `test-backend <class/module labels>` with the venv active; output is written
+                   to a file in the container and read back (survives flaky proxies on long stdout).
+
+    Local docker. `RemoteContainerEvaluator` overrides the transport to run over SSH.
     """
 
-    DEFAULT_IMAGE = "zulip/ci:bookworm"
-    MOUNT = "/srv/zulip"
+    runs_tests = True
+    DEFAULT_IMAGE = "fatbench/zulip-provisioned:zulip-001"
+    WORKDIR = "/srv/zulip"
+    SERVICES = ("postgresql", "redis-server", "rabbitmq-server", "memcached")
+    _LOG = "/tmp/fatbench_tb.log"
+    _RC = "/tmp/fatbench_tb.rc"
 
     def __init__(self, image: str | None = None, runtime: str | None = None,
-                 provision: bool = True):
+                 container_name: str = "fatbench-eval", parent_commit: str | None = None):
         self.image = image or self.DEFAULT_IMAGE
         self.runtime = runtime
-        self.provision = provision
-        self.container_id: str | None = None
+        self.container = container_name
+        self.parent_commit = parent_commit
 
-    def setup(self, workspace_path: Path) -> None:
+    # --- transport primitives (overridden by the remote subclass) -------------------
+    def _host_sh(self, script: str, stdin: str | None = None) -> subprocess.CompletedProcess:
+        """Run a bash script on the docker host (here: this machine)."""
+        return subprocess.run(
+            ["bash", "-c", script], input=stdin, capture_output=True, text=True,
+        )
+
+    def _ensure_runtime(self) -> None:
         self.runtime = self.runtime or detect_container_runtime()
         if not self.runtime:
             raise EnvironmentError(
-                "No working container runtime (docker/podman) found. Zulip's backend tests "
-                "need a Linux service stack. Options: install colima+docker (arm64 host runs the "
-                "amd64 zulip/ci image emulated), or run the harness on a Linux host. "
-                "Use --no-tests to score file metrics only."
+                "No working container runtime found on the docker host. Zulip's backend tests "
+                "need a Linux service stack. Run the harness against a host with docker (see "
+                "RemoteContainerEvaluator / --remote-host), or use --no-tests for file metrics only."
             )
-        subprocess.run([self.runtime, "pull", self.image], check=True)
-        proc = subprocess.run(
-            [self.runtime, "run", "-d", "-v", f"{workspace_path}:{self.MOUNT}",
-             "-w", self.MOUNT, self.image, "sleep", "infinity"],
-            check=True, capture_output=True, text=True,
-        )
-        self.container_id = proc.stdout.strip()
-        if self.provision:
-            self._exec(["./tools/ci/setup-backend", "--skip-dev-db-build"])
 
-    def _exec(self, argv: list[str]) -> subprocess.CompletedProcess:
-        if not self.container_id:
-            raise RuntimeError("ContainerEvaluator.setup() not called")
-        return subprocess.run(
-            [self.runtime, "exec", self.container_id, *argv],
-            capture_output=True, text=True,
+    # --- helpers on top of the transport --------------------------------------------
+    def _exec(self, container_cmd: str, stdin: str | None = None) -> subprocess.CompletedProcess:
+        """Run `bash -lc <container_cmd>` inside the container (login shell for PATH)."""
+        argv = f"{self.runtime} exec -i {self.container} bash -lc {shlex.quote(container_cmd)}"
+        return self._host_sh(argv, stdin=stdin)
+
+    def _put(self, text: str, dest: str) -> None:
+        """Pipe `text` into a file at `dest` inside the container (works local + over ssh)."""
+        argv = f"{self.runtime} exec -i {self.container} bash -c {shlex.quote(f'cat > {dest}')}"
+        self._host_sh(argv, stdin=text)
+
+    # --- Evaluator interface --------------------------------------------------------
+    def setup(self, workspace_path: Path) -> None:
+        self._ensure_runtime()
+        # Fresh container from the provisioned snapshot.
+        self._host_sh(f"{self.runtime} rm -f {self.container}")
+        r = self._host_sh(
+            f"{self.runtime} run -d --name {self.container} "
+            f"-w {self.WORKDIR} {self.image} sleep infinity"
         )
+        if r.returncode != 0:
+            raise EnvironmentError(f"failed to start container: {r.stderr.strip()}")
+        # Start the service stack (no init system in the bare container).
+        svc = " ".join(f"service {s} start >/dev/null 2>&1;" for s in self.SERVICES)
+        self._host_sh(f"{self.runtime} exec -u root {self.container} bash -c {shlex.quote(svc)}")
+
+    def stage(self, impl_diff: str, gold_tests_diff: str) -> tuple[bool, str]:
+        parent = self.parent_commit
+        if not parent:
+            return False, "ContainerEvaluator.parent_commit not set"
+        reset = self._exec(
+            f"cd {self.WORKDIR} && git reset --hard {parent} && git clean -fdq"
+        )
+        if reset.returncode != 0:
+            return False, f"reset failed: {reset.stderr.strip()}"
+        if impl_diff.strip():
+            self._put(impl_diff, "/tmp/impl.diff")
+            r = self._exec(f"cd {self.WORKDIR} && git apply /tmp/impl.diff")
+            if r.returncode != 0:
+                return False, f"impl diff apply failed: {r.stderr.strip()}"
+        if gold_tests_diff.strip():
+            self._put(gold_tests_diff, "/tmp/gold-tests.diff")
+            r = self._exec(f"cd {self.WORKDIR} && git apply /tmp/gold-tests.diff")
+            if r.returncode != 0:
+                return False, f"gold-tests overlay failed: {r.stderr.strip()}"
+        return True, "staged (impl + gold tests applied in container)"
+
+    def _run_in_env(self, inner: str) -> TestRunResult:
+        """Run `inner` under the venv, capturing output to a file and reading it back."""
+        self._exec(
+            f"cd {self.WORKDIR} && source .venv/bin/activate && "
+            f"{{ {inner} ; }} > {self._LOG} 2>&1; echo $? > {self._RC}"
+        )
+        log = self._exec(f"tail -c 200000 {self._LOG}").stdout
+        rc_raw = self._exec(f"cat {self._RC}").stdout.strip()
+        try:
+            rc = int(rc_raw)
+        except ValueError:
+            rc = 1
+        return parse_test_backend_output(log, "", rc)
 
     def run_tests(self, workspace_path: Path, test_ids: list[str]) -> TestRunResult:
         dotted = [nodeid_to_dotted(t) for t in test_ids]
-        proc = self._exec(["./tools/test-backend", *dotted])
-        return parse_test_backend_output(proc.stdout, proc.stderr, proc.returncode)
+        return self._run_in_env("./tools/test-backend " + " ".join(shlex.quote(d) for d in dotted))
 
     def run_command(self, workspace_path: Path, command: str) -> TestRunResult:
-        proc = self._exec(["bash", "-lc", command])
-        return parse_test_backend_output(proc.stdout, proc.stderr, proc.returncode)
+        return self._run_in_env(command)
 
     def teardown(self) -> None:
-        if self.container_id and self.runtime:
-            subprocess.run([self.runtime, "rm", "-f", self.container_id],
-                           capture_output=True, text=True)
-            self.container_id = None
+        if self.runtime:
+            self._host_sh(f"{self.runtime} rm -f {self.container}")
+
+
+class RemoteContainerEvaluator(ContainerEvaluator):
+    """ContainerEvaluator that drives docker on a remote host over SSH.
+
+    The docker daemon, the provisioned snapshot, and the Zulip checkout all live on the remote
+    Amazon Cloud Desktop (see ~/.rbg.conf); the harness runs on macOS. Only the transport
+    changes: every host command is wrapped in `ssh <host> <script>`, and file writes stream over
+    ssh stdin straight into `docker exec -i` — so no temp files on the remote host.
+    """
+
+    def __init__(self, host: str, **kwargs):
+        super().__init__(**kwargs)
+        self.host = host
+        self.runtime = self.runtime or "docker"  # remote daemon assumed; don't probe locally
+
+    def _ensure_runtime(self) -> None:
+        # Runtime lives on the remote; trust it (probing here would check the wrong machine).
+        self.runtime = self.runtime or "docker"
+
+    def _host_sh(self, script: str, stdin: str | None = None) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            ["ssh", "-o", "ConnectTimeout=20", "-o", "ServerAliveInterval=15", self.host, script],
+            input=stdin, capture_output=True, text=True,
+        )
