@@ -7,15 +7,31 @@ All correctness values use the FIXED grader (impl-only staged, gold tests overla
 
 ## Results
 
-| Run | config | complete | precision | correctness | regression | composite | tokens | turns | min |
-|-----|--------|---------:|----------:|------------:|-----------:|----------:|-------:|------:|----:|
-| Step 6 | baseline | 0.80 | 0.80 | 0 | 1.0 | — | 297K | 122 | 21.7 |
-| Step 7 | baseline | 0.80 | 0.80 | 0 | 1.0 | 0.57 | 291K | 126 | 32.2 |
-| Step 7 | full-harness | 0.60 | 0.75 | 0 | 1.0 | 0.51 | 192K | 115 | 26.4 |
+| Run | config | MCP | complete | precision | correctness | regression | composite | tokens | turns | min |
+|-----|--------|-----|---------:|----------:|------------:|-----------:|----------:|-------:|------:|----:|
+| Step 6 | baseline | on | 0.80 | 0.80 | 0 | 1.0 | — | 297K | 122 | 21.7 |
+| Step 7 | baseline | on | 0.80 | 0.80 | 0 | 1.0 | 0.57 | 291K | 126 | 32.2 |
+| Step 7 | full-harness | on | 0.60 | 0.75 | 0 | 1.0 | 0.51 | 192K | 115 | 26.4 |
+| Step 8 | baseline (vanilla) | **off** | 0.80 | 0.80 | 0 | **0.0** | 0.42 | 165K | 124 | 16.4 |
 
-(Step 6's on-disk `scores.json` shows correctness=1.0 — the pre-fix grading bug; the true
-value is 0, recorded in `scores.corrected.json`. Composite omitted for Step 6 as it was
-computed from the buggy correctness.)
+("MCP on" = the run inherited this machine's user-level MCP servers — not vanilla. "MCP off" =
+`--strict-mcp-config`, no MCP servers: clean vanilla Claude Code. Step 6's on-disk `scores.json`
+shows correctness=1.0 — the pre-fix grading bug; true value 0, in `scores.corrected.json`.)
+
+### Vanilla baseline (Step 8) — the clean "just the model on the task" control
+Re-ran baseline with MCP servers disabled (`--strict-mcp-config`), so it's genuinely vanilla
+Claude Code, not "as this machine is configured". Findings:
+- **File metrics identical to the MCP-on baselines** (0.80/0.80, same 7 matched, same 2 missed:
+  `event_schema.py` + `event_types.py`). Disabling MCP did NOT change *what* the agent found —
+  the fat-context failure is about the model's exploration, not tooling. Cheaper: 165K tokens.
+- **regression = 0.0 (NEW):** this run's impl references `Realm.REALM_TOPICS_POLICY_TYPES`, an
+  attribute it never defined; the regression suite hits that path → 34 pre-existing tests ERROR.
+  The earlier baseline's (different, also-wrong) code happened not to break regression.
+- **KEY CALIBRATION INSIGHT — run-to-run variance is real and axis-dependent.** Two baseline
+  runs agree *exactly* on file metrics but *diverge* on correctness/regression, because the agent
+  writes different (each wrong) code each attempt. The retrieval signal (which files) is stable;
+  the execution signal (does the code work) has variance. => N=1 per config is insufficient for
+  correctness/regression claims; file metrics are already stable at N=1.
 
 ## What each run missed (vs the 9 gold non-migration files)
 
@@ -41,18 +57,28 @@ computed from the buggy correctness.)
    actions the baseline found by exploration. Plausible read: the map made the agent
    confident it had covered the layers and stop exploring sooner. N=1 — do not over-read.
 
-3. **The instrument is reproducible.** Two independent baseline runs landed on the *same*
-   7 matched files, same 2 missed, 291K vs 297K tokens. The file metrics are stable signal.
+3. **The retrieval signal is reproducible; the execution signal is not (at N=1).** THREE
+   independent baseline runs (2 MCP-on, 1 vanilla) landed on the *same* 7 matched / 2 missed
+   files — file metrics are rock-stable. But correctness/regression varied: the vanilla run
+   broke 34 regression tests (regression=0.0) where the others didn't, because the agent writes
+   different (each wrong) code each attempt. **Implication: file metrics are trustworthy at N=1;
+   correctness/regression need multiple runs per config.**
 
-4. **File metrics discriminate where correctness can't.** All three runs have correctness=0,
-   but completeness cleanly separates them (0.8 vs 0.6) and pinpoints *which layer* each
-   dropped — the diagnostic signal a pass/fail-only oracle (SWE-bench) discards. This is the
-   core value proposition, demonstrated.
+4. **Vanilla vs machine-configured (MCP) baseline: no file-metric difference.** Disabling MCP
+   servers (`--strict-mcp-config`) left completeness/precision unchanged (0.80/0.80) and just
+   made the run cheaper (165K vs ~291K tokens). On this task the model's MCP tooling didn't help
+   it find the missing layer — the gap is exploration/reasoning, not tools.
+
+5. **File metrics discriminate where correctness can't.** All runs have correctness=0, but
+   completeness cleanly separates configs (0.8 baseline vs 0.6 full-harness) and pinpoints
+   *which layer* each dropped — the diagnostic signal a pass/fail-only oracle (SWE-bench)
+   discards. This is the core value proposition, demonstrated.
 
 ## Caveats
 
-- **N=1 task, 1 run per config.** The full-harness-is-worse result is a single observation;
-  it could be run-to-run variance. A real conclusion needs multiple seeds and multiple tasks.
+- **N=1 task, 1 run per config (except baseline, N=3).** The full-harness-is-worse result is a
+  single observation and could be variance — and we now have DIRECT evidence that correctness/
+  regression vary run-to-run (finding 3). A real conclusion needs multiple seeds and more tasks.
 - **CLAUDE.md is one specific onboarding doc.** A different phrasing (or one that pointed at
   an analogous existing setting to mirror) might help. This measures *this* doc, not
   "onboarding" in general.
