@@ -1,0 +1,65 @@
+{
+  "baseline_step6": {
+    "config": "baseline",
+    "completeness": 0.8,
+    "precision": 0.8,
+    "correctness": 0.0,
+    "regression": 1.0,
+    "composite": 0.92,
+    "tokens": 297073,
+    "num_turns": 122,
+    "duration_min": 21.7,
+    "missed": [
+      "zerver/lib/event_schema.py",
+      "zerver/lib/event_types.py"
+    ],
+    "extra": [
+      "api_docs/changelog.md",
+      "version.py"
+    ],
+    "matched_n": 7,
+    "_note": "correctness corrected from buggy on-disk 1.0; see scores.corrected.json"
+  },
+  "baseline_step7": {
+    "config": "baseline",
+    "completeness": 0.8,
+    "precision": 0.8,
+    "correctness": 0.0,
+    "regression": 1.0,
+    "composite": 0.57,
+    "tokens": 291229,
+    "num_turns": 126,
+    "duration_min": 32.2,
+    "missed": [
+      "zerver/lib/event_schema.py",
+      "zerver/lib/event_types.py"
+    ],
+    "extra": [
+      "api_docs/changelog.md",
+      "version.py"
+    ],
+    "matched_n": 7
+  },
+  "full_harness": {
+    "config": "full-harness",
+    "completeness": 0.6,
+    "precision": 0.75,
+    "correctness": 0.0,
+    "regression": 1.0,
+    "composite": 0.5125,
+    "tokens": 191898,
+    "num_turns": 115,
+    "duration_min": 26.4,
+    "missed": [
+      "zerver/actions/message_edit.py",
+      "zerver/actions/message_send.py",
+      "zerver/lib/event_schema.py",
+      "zerver/lib/event_types.py"
+    ],
+    "extra": [
+      "api_docs/changelog.md",
+      "version.py"
+    ],
+    "matched_n": 5
+  }
+}

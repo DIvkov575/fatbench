@@ -128,13 +128,31 @@ Run dir `results/20260707-121626_zulip-001_baseline/`. ~30 min agent, **297K tok
   writes `patch.impl.diff` + `patch.agent-tests.diff`. 37 unit tests pass (+2). The buggy
   `scores.json` is preserved; `scores.corrected.json` holds the true correctness=0.
 
+### Done (cont.) — 2026-07-07 session: Step 7 comparison DONE ✅ (MVP complete)
+Full writeup: `analysis/step7-comparison.md` (+ `.json`). Two sequential live runs with the
+FIXED harness (they share the `fatbench-eval` container, so cannot overlap).
+
+| config | complete | precision | correctness | regression | composite | tokens | turns |
+|--------|---------:|----------:|------------:|-----------:|----------:|-------:|------:|
+| baseline (clean re-run) | 0.80 | 0.80 | 0 | 1.0 | 0.57 | 291K | 126 |
+| full-harness | 0.60 | 0.75 | 0 | 1.0 | 0.51 | 192K | 115 |
+
+- **Both correctness=0** — both miss `event_schema.py`+`event_types.py`, so `test_events`/
+  `test_home` fail. The onboarding CLAUDE.md (which explicitly warns about forgetting the
+  event-system registration) did NOT get the agent to those files.
+- **Full-harness scored LOWER on files (0.60 vs 0.80) with ~34% fewer tokens**, ran to
+  completion (not truncated). It also dropped the enforcement actions (`message_send/edit`)
+  the baseline found. Read: the map made it stop exploring sooner. **N=1 — do not over-read.**
+- **Reproducibility confirmed:** two baseline runs → identical 7 matched / 2 missed, 291K vs 297K.
+- **File metrics discriminate where correctness can't** (all 0, but 0.8 vs 0.6 pinpoints the
+  dropped layer) — the core value prop, demonstrated. MVP goal (LLD §8) met.
+
 ## Next steps
-- **Step 7 (compare):** baseline vs full-harness (Zulip onboarding CLAUDE.md). Does onboarding get
-  the agent to the event-system layer it missed? Same command with `--config configs/full-harness.yaml`.
-  Re-confirm the baseline number with the FIXED harness (the 0.8/0 above was re-graded from the
-  saved diff, not a fresh end-to-end run).
-- **Grow the task set:** run `author.py discover` on Zulip, `build` 2-3 candidates, review/scrub
-  them into real tasks. Each reuses the same snapshot. Consider a second repo (dbt-core) later.
+- **Grow the task set (the real next phase):** `author.py discover` on Zulip, `build` 2-3
+  candidates, review/scrub into real tasks. Each reuses the snapshot. Consider dbt-core later.
+- **Strengthen the finding:** multiple runs per config (seeds) + more tasks before trusting the
+  "full-harness is worse" signal. Consider an onboarding variant that points at an analogous
+  existing setting to mirror, rather than prose warnings.
 - **Author.py polish (optional):** `discover` does one `pulls/<n>` call per candidate (rate-OK but
   slowish); could batch. Frontend-prefix list is Zulip-specific — parameterize per repo.
 
