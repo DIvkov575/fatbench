@@ -43,12 +43,29 @@ def invoke_claude_code(
     timeout_seconds: int,
     extra_args: list[str] | None = None,
     claude_bin: str = "claude",
+    isolate: bool = True,
 ) -> AgentResult:
+    """Run `claude -p` on the task.
+
+    `isolate=True` (default) adds `--strict-mcp-config` so NO MCP servers load — the agent gets
+    plain Claude Code + the repo + the task prompt, with none of the host's user-level MCP
+    "plugins". This keeps the benchmark measuring the model's own fat-context ability, not
+    whatever MCP tooling a given machine happens to have installed, and it applies IDENTICALLY
+    to both the baseline and full-harness arms so the only variable between them stays the
+    injected CLAUDE.md.
+
+    Deliberately NOT using `--bare`: verified (2026-07-07) that `--bare` also suppresses the
+    *workspace's own* CLAUDE.md, which would silently disable the full-harness config's onboarding
+    doc and confound the comparison. `--setting-sources project,local` was also rejected — it drops
+    the `user` source where OAuth lives and breaks auth (403). `--strict-mcp-config` alone keeps
+    auth + reads the workspace CLAUDE.md while removing MCP servers — exactly what we want.
+    """
     workspace_path = Path(workspace_path)
     args = [
         claude_bin, "-p", prompt,
         "--output-format", "json",
         "--dangerously-skip-permissions",
+        *(["--strict-mcp-config"] if isolate else []),
         *(extra_args or []),
     ]
 
