@@ -105,6 +105,13 @@ def run(
             )
 
         agent_paths = diffutil.parse_changed_paths(agent_diff)
+        # Grade only the agent's IMPLEMENTATION. Its test edits are discarded before the gold
+        # tests are overlaid — otherwise the agent could pass by weakening tests (CLAUDE.md
+        # invariant "gates come from the PR, not the agent").
+        impl_diff, agent_test_diff = diffutil.split_diff_by_role(agent_diff)
+        (out_dir / "patch.impl.diff").write_text(impl_diff)
+        if agent_test_diff.strip():
+            (out_dir / "patch.agent-tests.diff").write_text(agent_test_diff)
 
         # 4. GRADE ------------------------------------------------------------
         file_metrics = scorer.score_files(agent_paths.impl_paths, task.gold_patch_files)
@@ -116,9 +123,9 @@ def run(
         if not isinstance(evaluator, NullEvaluator):
             try:
                 evaluator.setup(work.path)
-                # Stage inside the (provisioned) env: reset -> agent impl diff -> overlay gold
+                # Stage inside the (provisioned) env: reset -> agent IMPL diff -> overlay gold
                 # tests, so the PR's tests — not the agent's — have authority over the gates.
-                staged, msg = evaluator.stage(agent_diff, gold_tests_diff)
+                staged, msg = evaluator.stage(impl_diff, gold_tests_diff)
                 if not staged:
                     print(f"[harness] WARNING: staging failed: {msg}", file=sys.stderr)
                 gate_result = evaluator.run_tests(work.path, task.gate_tests)

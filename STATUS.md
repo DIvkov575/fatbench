@@ -103,10 +103,36 @@ docker exec zfb bash -lc 'cd /srv/zulip && git reset --hard 8fb1eeeb09 && git cl
     later parent) and flagged the `topics_policy`/`mandatory_topics` leakage. Emitted YAML parses.
   - **35 unit tests pass** (was 30; +5 author tests for classify/split/fatness/leakage).
 
+### Done (cont.) — 2026-07-07 session: Step 6 calibration run DONE ✅
+First LIVE `claude -p` agent on zulip-001, baseline config (no CLAUDE.md), gates on the remote.
+Run dir `results/20260707-121626_zulip-001_baseline/`. ~30 min agent, **297K tokens** (of 1.2M).
+
+- **Result (corrected — see harness bug below): completeness=0.8, precision=0.8, correctness=0.**
+  - The agent touched 7/9 gold files but **MISSED `zerver/lib/event_schema.py` +
+    `zerver/lib/event_types.py`** (the event-system registration layer) and added 2 extras
+    (`api_docs/changelog.md`, `version.py`).
+  - Consequently **3 gold gate tests fail** (95/98 pass): `test_events.RealmPropertyActionTest.
+    test_change_realm_property` and `test_home.HomeTest.{test_home,test_home_demo_organization}`
+    — i.e. the setting doesn't propagate through events / initial client state.
+  - This is the textbook fat-context failure: correct model+actions+views, **dropped a layer**,
+    confident-but-wrong. File metrics (0.8) still show it was *close* — the signal SWE-bench discards.
+- **Instrument validated on all four LLD §8 criteria:** discrimination ✅ (0.8, not 0/1),
+  retrieval pressure real ✅ (missing files → gate failures), mechanically sound ✅ (live agent
+  end-to-end), gate validity ✅ (gold passes, incomplete fails).
+
+- **HARNESS BUG found & fixed (only a LIVE run could surface it):** the grader staged the agent's
+  FULL diff — including its edits to the 5 test files — so the gold-tests overlay hit a patch
+  conflict, was skipped, and gates ran against the AGENT'S OWN tests (→ bogus correctness=1.0,
+  violating "gates come from the PR, not the agent"). Fix: `diffutil.split_diff_by_role()` splits
+  the agent diff into impl vs test; `run.py` now stages IMPL-ONLY then overlays gold tests, and
+  writes `patch.impl.diff` + `patch.agent-tests.diff`. 37 unit tests pass (+2). The buggy
+  `scores.json` is preserved; `scores.corrected.json` holds the true correctness=0.
+
 ## Next steps
-- **Step 6 (calibration run):** baseline (no CLAUDE.md) on the remote — real `claude -p` agent on
-  zulip-001, measure token burn + where it gets stuck. `harness.run` (no `--dry-run`) is ready.
-- **Step 7 (compare):** baseline vs full-harness; results JSON + analysis.
+- **Step 7 (compare):** baseline vs full-harness (Zulip onboarding CLAUDE.md). Does onboarding get
+  the agent to the event-system layer it missed? Same command with `--config configs/full-harness.yaml`.
+  Re-confirm the baseline number with the FIXED harness (the 0.8/0 above was re-graded from the
+  saved diff, not a fresh end-to-end run).
 - **Grow the task set:** run `author.py discover` on Zulip, `build` 2-3 candidates, review/scrub
   them into real tasks. Each reuses the same snapshot. Consider a second repo (dbt-core) later.
 - **Author.py polish (optional):** `discover` does one `pulls/<n>` call per candidate (rate-OK but

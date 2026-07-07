@@ -41,6 +41,36 @@ class DiffPaths:
         return any(is_migration_file(p) for p in self.all_paths)
 
 
+def split_diff_by_role(diff_text: str) -> tuple[str, str]:
+    """Split unified-diff text into (impl_diff, test_diff) by per-file `diff --git` blocks.
+
+    The agent's diff often edits BOTH implementation and test files. For grading we must apply
+    only the implementation and then overlay the *gold* tests — otherwise the agent could pass
+    by weakening tests (CLAUDE.md invariant). This partitions the raw diff text so each file's
+    hunk lands in exactly one bucket, keyed by the same `is_test_file` rule used for scoring.
+    """
+    impl_parts: list[str] = []
+    test_parts: list[str] = []
+    cur_is_test = False
+    cur: list[str] = []
+
+    def _flush() -> None:
+        if cur:
+            (test_parts if cur_is_test else impl_parts).append("".join(cur))
+
+    for line in diff_text.splitlines(keepends=True):
+        m = _DIFF_GIT_RE.match(line.rstrip("\n"))
+        if m:
+            _flush()
+            cur = [line]
+            path = m.group("b") or m.group("a")
+            cur_is_test = is_test_file(path)
+        else:
+            cur.append(line)
+    _flush()
+    return "".join(impl_parts), "".join(test_parts)
+
+
 def parse_changed_paths(diff_text: str) -> DiffPaths:
     """Extract touched paths from unified-diff text.
 
