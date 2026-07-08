@@ -119,22 +119,24 @@ def test_stage_applies_impl_then_gold(monkeypatch):
     ev = ContainerEvaluator(parent_commit="abc123")
     ev.runtime = "docker"
 
-    def fake_host_sh(script, stdin=None):
-        calls.append(("sh", script, stdin))
+    def fake_exec(cmd, stdin=None):
+        calls.append(("sh", cmd, stdin))
         return _FakeProc(returncode=0)
 
-    monkeypatch.setattr(ev, "_host_sh", fake_host_sh)
+    # Stub _exec (all container commands) and _put (verified write, tested separately).
+    monkeypatch.setattr(ev, "_exec", fake_exec)
+    monkeypatch.setattr(ev, "_put", lambda text, dest: calls.append(("put", dest, text)))
     ok, msg = ev.stage("IMPL_DIFF", "GOLD_DIFF")
     assert ok, msg
     scripts = [c[1] for c in calls]
     joined = "\n".join(scripts)
-    # reset to parent happens, venv re-syncs, then both diffs are cat'd in and applied
+    # reset to parent happens, venv re-syncs, then both diffs are put + applied
     assert "git reset --hard abc123" in joined
     assert "uv sync --frozen --group dev --inexact" in joined
     assert "git apply /tmp/impl.diff" in joined
     assert "git apply /tmp/gold-tests.diff" in joined
-    stdins = [c[2] for c in calls if c[2]]
-    assert "IMPL_DIFF" in stdins and "GOLD_DIFF" in stdins
+    puts = [c[2] for c in calls if c[0] == "put"]
+    assert "IMPL_DIFF" in puts and "GOLD_DIFF" in puts
     # ordering: reset -> sync -> impl apply
     reset_i = next(i for i, s in enumerate(scripts) if "git reset" in s)
     sync_i = next(i for i, s in enumerate(scripts) if "uv sync" in s)
@@ -146,7 +148,8 @@ def test_stage_sync_can_be_disabled():
     ev = ContainerEvaluator(parent_commit="abc123", sync_venv=False)
     ev.runtime = "docker"
     calls = []
-    ev._host_sh = lambda script, stdin=None: (calls.append(script) or _FakeProc(returncode=0))
+    ev._exec = lambda cmd, stdin=None: (calls.append(cmd) or _FakeProc(returncode=0))
+    ev._put = lambda text, dest: None
     ok, _ = ev.stage("IMPL", "")
     assert ok and not any("uv sync" in c for c in calls)
 
@@ -155,11 +158,12 @@ def test_stage_fails_if_sync_fails():
     ev = ContainerEvaluator(parent_commit="abc123")
     ev.runtime = "docker"
 
-    def fake(script, stdin=None):
-        rc = 1 if "uv sync" in script else 0
+    def fake_exec(cmd, stdin=None):
+        rc = 1 if "uv sync" in cmd else 0
         return _FakeProc(stderr="lockfile mismatch" if rc else "", returncode=rc)
 
-    ev._host_sh = fake
+    ev._exec = fake_exec
+    ev._put = lambda text, dest: None
     ok, msg = ev.stage("IMPL", "GOLD")
     assert not ok and "venv sync failed" in msg
 
@@ -194,6 +198,63 @@ def test_stage_fails_without_parent_commit():
     ev.runtime = "docker"
     ok, msg = ev.stage("x", "y")
     assert not ok and "parent_commit" in msg
+
+
+def test_put_verifies_byte_count(monkeypatch):
+    """_put must confirm the written byte count matches; retry then raise on persistent mismatch."""
+    ev = ContainerEvaluator(parent_commit="abc")
+    ev.runtime = "docker"
+    # _host_sh is the write; _exec is the verify (wc -c). Simulate a short write forever.
+    ev._host_sh = lambda script, stdin=None: _FakeProc(returncode=0)
+    ev._exec = lambda cmd, stdin=None: _FakeProc(stdout="5\n")  # always reports 5 bytes
+    import pytest
+    with pytest.raises(RuntimeError, match="after 3 attempts"):
+        ev._put("HELLO_WORLD", "/tmp/x.diff")  # 11 bytes != 5
+
+
+def test_put_succeeds_when_bytecount_matches():
+    ev = ContainerEvaluator(parent_commit="abc")
+    ev.runtime = "docker"
+    ev._host_sh = lambda script, stdin=None: _FakeProc(returncode=0)
+    ev._exec = lambda cmd, stdin=None: _FakeProc(stdout="11\n")
+    ev._put("HELLO_WORLD", "/tmp/x.diff")  # 11 bytes — no raise
+
+
+def test_stage_clears_stale_staging_files():
+    """stage() must rm the /tmp diffs before writing (snapshot may carry a prior task's diffs)."""
+    ev = ContainerEvaluator(parent_commit="abc123", sync_venv=False)
+    ev.runtime = "docker"
+    calls = []
+    ev._host_sh = lambda script, stdin=None: (calls.append(script) or _FakeProc(returncode=0))
+    ev._exec = lambda cmd, stdin=None: (calls.append(cmd) or _FakeProc(stdout="4\n", returncode=0))
+    ev._put = lambda text, dest: calls.append(f"PUT {dest}")
+    ev.stage("IMPL", "GOLD")
+    rm_i = next(i for i, c in enumerate(calls) if "rm -f /tmp/impl.diff" in c)
+    reset_i = next(i for i, c in enumerate(calls) if "git reset" in c)
+    assert rm_i < reset_i  # cleared before reset/apply
+
+
+def test_remote_host_sh_retries_transient(monkeypatch):
+    """RemoteContainerEvaluator retries WSSH/transport failures but not real command errors."""
+    ev = RemoteContainerEvaluator(host="h")
+    seq = [_FakeProc(stderr="WSSH Proxy getaddrinfo ENOTFOUND", returncode=255),
+           _FakeProc(stdout="ok", returncode=0)]
+    calls = {"n": 0}
+
+    def fake_run(argv, input=None, capture_output=None, text=None):
+        i = calls["n"]; calls["n"] += 1
+        return seq[i]
+
+    monkeypatch.setattr(_sp, "run", fake_run)
+    r = ev._host_sh("docker ps")
+    assert r.returncode == 0 and calls["n"] == 2  # retried once past the WSSH blip
+
+    # real error (non-transient) is NOT retried
+    calls["n"] = 0
+    monkeypatch.setattr(_sp, "run",
+                        lambda *a, **k: _FakeProc(stderr="fatal: bad object", returncode=128))
+    r2 = ev._host_sh("git thing")
+    assert r2.returncode == 128
 
 
 def test_remote_evaluator_wraps_in_ssh(monkeypatch):

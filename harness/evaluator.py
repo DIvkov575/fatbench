@@ -249,9 +249,25 @@ class ContainerEvaluator(Evaluator):
         return self._host_sh(argv, stdin=stdin)
 
     def _put(self, text: str, dest: str) -> None:
-        """Pipe `text` into a file at `dest` inside the container (works local + over ssh)."""
+        """Pipe `text` into a file at `dest` inside the container, VERIFIED.
+
+        Raises RuntimeError if the write didn't land intact. This matters over SSH: the WSSH
+        proxy can drop a streamed stdin mid-transfer (getaddrinfo ENOTFOUND / connection closed)
+        and `docker exec` still exits 0 with a truncated or empty file. A silent partial write is
+        catastrophic here — a stale `dest` (e.g. baked into the snapshot image from a prior task's
+        validation) would then be applied instead. So we byte-count both sides and retry.
+        """
+        want = len(text.encode())
         argv = f"{self.runtime} exec -i {self.container} bash -c {shlex.quote(f'cat > {dest}')}"
-        self._host_sh(argv, stdin=text)
+        last = ""
+        for attempt in range(3):
+            self._host_sh(argv, stdin=text)
+            got = self._exec(f"wc -c < {shlex.quote(dest)} 2>/dev/null || echo -1").stdout.strip()
+            if got.isdigit() and int(got) == want:
+                return
+            last = f"wrote {got} bytes, expected {want}"
+        raise RuntimeError(f"failed to stage {dest} after 3 attempts ({last}) — "
+                           "likely a flaky SSH/WSSH transport; retry the run")
 
     # --- Evaluator interface --------------------------------------------------------
     def setup(self, workspace_path: Path) -> None:
@@ -272,6 +288,10 @@ class ContainerEvaluator(Evaluator):
         parent = self.parent_commit
         if not parent:
             return False, "ContainerEvaluator.parent_commit not set"
+        # Remove any staging files left in the image/previous run FIRST. The snapshot was
+        # `docker commit`ed with a prior task's /tmp/*.diff baked in; a silently-failed _put would
+        # otherwise leave those stale diffs to be applied. Delete, then write+verify, then apply.
+        self._exec("rm -f /tmp/impl.diff /tmp/gold-tests.diff")
         reset = self._exec(
             f"cd {self.WORKDIR} && git reset --hard {parent} && git clean -fdq"
         )
@@ -282,16 +302,19 @@ class ContainerEvaluator(Evaluator):
             sync = self._exec(f"cd {self.WORKDIR} && {self._SYNC_CMD}")
             if sync.returncode != 0:
                 return False, f"venv sync failed: {sync.stderr.strip()[-500:]}"
-        if impl_diff.strip():
-            self._put(impl_diff, "/tmp/impl.diff")
-            r = self._exec(f"cd {self.WORKDIR} && git apply /tmp/impl.diff")
-            if r.returncode != 0:
-                return False, f"impl diff apply failed: {r.stderr.strip()}"
-        if gold_tests_diff.strip():
-            self._put(gold_tests_diff, "/tmp/gold-tests.diff")
-            r = self._exec(f"cd {self.WORKDIR} && git apply /tmp/gold-tests.diff")
-            if r.returncode != 0:
-                return False, f"gold-tests overlay failed: {r.stderr.strip()}"
+        try:
+            if impl_diff.strip():
+                self._put(impl_diff, "/tmp/impl.diff")
+                r = self._exec(f"cd {self.WORKDIR} && git apply /tmp/impl.diff")
+                if r.returncode != 0:
+                    return False, f"impl diff apply failed: {r.stderr.strip()}"
+            if gold_tests_diff.strip():
+                self._put(gold_tests_diff, "/tmp/gold-tests.diff")
+                r = self._exec(f"cd {self.WORKDIR} && git apply /tmp/gold-tests.diff")
+                if r.returncode != 0:
+                    return False, f"gold-tests overlay failed: {r.stderr.strip()}"
+        except RuntimeError as e:  # verified _put gave up after retries
+            return False, str(e)
         return True, "staged (impl + gold tests applied in container)"
 
     def _run_in_env(self, inner: str) -> TestRunResult:
@@ -348,8 +371,24 @@ class RemoteContainerEvaluator(ContainerEvaluator):
         # Runtime lives on the remote; trust it (probing here would check the wrong machine).
         self.runtime = self.runtime or "docker"
 
+    # Substrings that mark a transient SSH/WSSH-proxy failure (not a real command error).
+    _TRANSIENT = ("WSSH", "getaddrinfo ENOTFOUND", "Connection closed by",
+                  "banner exchange", "Connection timed out", "kex_exchange")
+
     def _host_sh(self, script: str, stdin: str | None = None) -> subprocess.CompletedProcess:
-        return subprocess.run(
-            ["ssh", "-o", "ConnectTimeout=20", "-o", "ServerAliveInterval=15", self.host, script],
-            input=stdin, capture_output=True, text=True,
-        )
+        # The Amazon WSSH proxy intermittently drops connections. Retry a few times when the
+        # failure looks like transport flakiness (never on a genuine non-zero from the command).
+        last = None
+        for attempt in range(4):
+            proc = subprocess.run(
+                ["ssh", "-o", "ConnectTimeout=20", "-o", "ServerAliveInterval=15",
+                 self.host, script],
+                input=stdin, capture_output=True, text=True,
+            )
+            last = proc
+            if proc.returncode == 0:
+                return proc
+            blob = (proc.stderr or "") + (proc.stdout or "")
+            if not any(m in blob for m in self._TRANSIENT):
+                return proc  # real command failure — don't retry
+        return last
