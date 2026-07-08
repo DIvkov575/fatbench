@@ -22,12 +22,25 @@ Diversity thesis + full design: `analysis/zulip-002-003-design.md`; writing plan
    (`merge_commit_sha ~ commits`); verified against #28617 (N=11) and #34505 (N=2). NOTE: no API-only
    heuristic is safe across all merge modes — the authoritative check stays "does the gold diff apply
    on this parent in a local clone?" (Builders/Validator do this).
-2. **TODO — `ContainerEvaluator` venv/provision handling for newer-than-snapshot parents.** The
-   `fatbench/zulip-provisioned:zulip-001` snapshot venv is stale for 002/003's parents. Each run must:
-   (a) pass `--skip-provision-check` to test-backend, (b) `uv sync --frozen --group dev --inexact`
-   with `VIRTUAL_ENV`/`UV_PROJECT_ENVIRONMENT=/srv/zulip/.venv` before tests (re-sync when switching
-   tasks — lockfiles differ), (c) stage diffs/logs OUTSIDE `/srv/zulip` (git clean wipes it). The
-   evaluator currently does none of these; add before running 002/003 through `harness.run`.
+2. **FIXED — `ContainerEvaluator` now runs newer-than-snapshot parents end-to-end.** Verified
+   2026-07-08 by dry-running zulip-002 through `harness.run --remote-host`: the gold diff scores
+   completeness/precision/correctness/regression = 1.0 (composite 0.9). Changes:
+   - `stage()` re-syncs the venv to the parent's lockfile (`uv sync --frozen --group dev --inexact`,
+     `VIRTUAL_ENV`/`UV_PROJECT_ENVIRONMENT=/srv/zulip/.venv`); toggle via `sync_venv`.
+   - `run_tests`/`run_command` pass/inject `--skip-provision-check`.
+   - **Staging transport rewritten (this was the hard bug).** The old `_put` streamed the diff over
+     ssh-stdin into `docker exec -i`; the Amazon **WSSH proxy silently truncated** large payloads
+     (an 18KB diff cut to ~7.5KB, exit 0), so `git apply` hit a partial/**stale** diff. Worse, the
+     snapshot image had zulip-001's `/tmp/gold-tests.diff` baked in (from June-23 validation), which
+     got applied instead → the mysterious `test_events.py:4259` error on a zulip-002 run. Fixes:
+       • `_put` now `scp`s the diff to the host + `docker cp`s into the container (no stdin stream),
+         then **`chmod 644`** (docker cp lands it as host uid 34727450/0600 → the container `github`
+         user couldn't read it) and **byte-count verifies**; raises loudly instead of applying junk.
+       • `stage()` `rm -f`s `/tmp/*.diff` before writing; the baked-in stale diffs were scrubbed
+         from the image and it was re-committed clean.
+       • `RemoteContainerEvaluator._host_sh` retries transient WSSH failures (never real errors).
+   - Staging files live in `/tmp` (outside `/srv/zulip`), already safe from `git clean`.
+   45 unit tests pass.
 
 ---
 
