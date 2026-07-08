@@ -214,13 +214,36 @@ def fatness(split: SplitDiff) -> dict:
 
 
 def _parent_commit(repo: str, pr_number: int) -> tuple[str, str]:
-    """Return (merge/head sha, parent sha) for the PR. Parent = the 'before' state."""
+    """Return (head sha, parent sha) for the PR, where parent = the pre-PR "before" state.
+
+    DO NOT use `merge_commit_sha^`. Zulip REBASE-MERGES, so the PR lands as N linear commits and
+    `merge_commit_sha` is the LAST of them — `merge_commit_sha^` is the PR's own second-to-last
+    commit, not the pre-PR base. Nor can you use `pulls/N/commits`[0]'s parent: that list holds
+    the ORIGINAL pre-rebase commits, whose branch point differs from where the rebased commits
+    actually landed on main.
+
+    Correct for a rebase-merge: the N landed commits are exactly the last N reachable from
+    `merge_commit_sha` by first-parent, so the true "before" state is `merge_commit_sha ~ N`,
+    where N = the PR's commit count. Verified 2026-07-08: PR #28617 (N=11) -> 454905f98,
+    PR #34505 (N=2) -> 1af039d8 — both match the empirically diff-verified parents.
+
+    CAVEAT: this is correct for rebase-merge (Zulip's mode) and squash (N collapses to 1, so
+    head~1). It is NOT correct for a true merge commit. Since no API-only heuristic is safe across
+    all merge modes, the authoritative check remains "does the gold diff apply on this parent in a
+    local clone?" — a human/Validator must confirm (the Builder/Validator do this).
+    """
     pr = json.loads(_gh(["api", f"repos/{repo}/pulls/{pr_number}"]))
     head_sha = pr["merge_commit_sha"] or pr["head"]["sha"]
-    commit = json.loads(_gh(["api", f"repos/{repo}/commits/{head_sha}"]))
-    parents = commit.get("parents", [])
-    parent_sha = parents[0]["sha"] if parents else ""
-    return head_sha, parent_sha
+    n_commits = int(pr.get("commits", 1)) or 1
+    # Walk N first-parent steps back from the head/merge commit.
+    sha = head_sha
+    for _ in range(n_commits):
+        commit = json.loads(_gh(["api", f"repos/{repo}/commits/{sha}"]))
+        parents = commit.get("parents", [])
+        if not parents:
+            break
+        sha = parents[0]["sha"]
+    return head_sha, sha
 
 
 def build(repo: str, pr_number: int, task_id: str, out_dir: Path) -> dict:

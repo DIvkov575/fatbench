@@ -1,0 +1,506 @@
+diff --git a/api_docs/changelog.md b/api_docs/changelog.md
+index d83ff87d37e46..0fba2525cc559 100644
+--- a/api_docs/changelog.md
++++ b/api_docs/changelog.md
+@@ -20,6 +20,11 @@ format used by the Zulip server that they are interacting with.
+ 
+ ## Changes in Zulip 11.0
+ 
++**Feature level 381**
++
++* [`POST /reminders`](/api/create-message-reminder): Added a new endpoint to
++  schedule personal reminder for a message.
++
+ **Feature level 380**
+ 
+ * [`POST /register`](/api/register-queue), [`GET
+diff --git a/api_docs/include/rest-endpoints.md b/api_docs/include/rest-endpoints.md
+index 035f4de19b89c..c3eb97fa601db 100644
+--- a/api_docs/include/rest-endpoints.md
++++ b/api_docs/include/rest-endpoints.md
+@@ -26,6 +26,10 @@
+ * [Edit a scheduled message](/api/update-scheduled-message)
+ * [Delete a scheduled message](/api/delete-scheduled-message)
+ 
++#### Message reminders
++
++* [Create a message reminder](/api/create-message-reminder)
++
+ #### Drafts
+ 
+ * [Get drafts](/api/get-drafts)
+diff --git a/version.py b/version.py
+index ef975069baf3b..7e1f557a756eb 100644
+--- a/version.py
++++ b/version.py
+@@ -34,7 +34,7 @@
+ # new level means in api_docs/changelog.md, as well as "**Changes**"
+ # entries in the endpoint's documentation in `zulip.yaml`.
+ 
+-API_FEATURE_LEVEL = 380
++API_FEATURE_LEVEL = 381
+ 
+ # Bump the minor PROVISION_VERSION to indicate that folks should provision
+ # only when going from an old version of the code to a newer version. Bump
+diff --git a/zerver/actions/reminders.py b/zerver/actions/reminders.py
+new file mode 100644
+index 0000000000000..472ebfd587f83
+--- /dev/null
++++ b/zerver/actions/reminders.py
+@@ -0,0 +1,39 @@
++import datetime
++
++from zerver.actions.message_send import check_message
++from zerver.actions.scheduled_messages import do_schedule_messages
++from zerver.lib.addressee import Addressee
++from zerver.lib.message import access_message
++from zerver.lib.reminders import get_reminder_formatted_content
++from zerver.models import Client, ScheduledMessage, UserProfile
++
++
++def schedule_reminder_for_message(
++    current_user: UserProfile,
++    client: Client,
++    message_id: int,
++    deliver_at: datetime.datetime,
++) -> int:
++    message = access_message(current_user, message_id, is_modifying_message=False)
++    # Even though reminder will be sent from NOTIFICATION_BOT, we still
++    # set current_user as the sender here to help us make the permission checks easier.
++    addressee = Addressee.for_user_profile(current_user)
++    # This can raise an exception in the unlikely event that the current user cannot DM themself.
++    send_request = check_message(
++        current_user,
++        client,
++        addressee,
++        get_reminder_formatted_content(message, current_user),
++        current_user.realm,
++        forwarder_user_profile=current_user,
++    )
++    send_request.deliver_at = deliver_at
++    send_request.reminder_target_message_id = message_id
++
++    return do_schedule_messages(
++        [send_request],
++        current_user,
++        read_by_sender=False,
++        skip_events=True,
++        delivery_type=ScheduledMessage.REMIND,
++    )[0]
+diff --git a/zerver/actions/scheduled_messages.py b/zerver/actions/scheduled_messages.py
+index e15713975a418..a418a278fded7 100644
+--- a/zerver/actions/scheduled_messages.py
++++ b/zerver/actions/scheduled_messages.py
+@@ -16,10 +16,16 @@
+ from zerver.actions.uploads import check_attachment_reference_change, do_claim_attachments
+ from zerver.lib.addressee import Addressee
+ from zerver.lib.display_recipient import get_recipient_ids
+-from zerver.lib.exceptions import JsonableError, RealmDeactivatedError, UserDeactivatedError
++from zerver.lib.exceptions import (
++    DeliveryTimeNotInFutureError,
++    JsonableError,
++    RealmDeactivatedError,
++    UserDeactivatedError,
++)
+ from zerver.lib.markdown import render_message_markdown
+-from zerver.lib.message import SendMessageRequest, truncate_topic
++from zerver.lib.message import SendMessageRequest, access_message, truncate_topic
+ from zerver.lib.recipient_parsing import extract_direct_message_recipient_ids, extract_stream_id
++from zerver.lib.reminders import get_reminder_formatted_content
+ from zerver.lib.scheduled_messages import access_scheduled_message
+ from zerver.lib.string_validation import check_stream_topic
+ from zerver.models import Client, Realm, ScheduledMessage, Subscription, UserProfile
+@@ -63,7 +69,11 @@ def check_schedule_message(
+         )
+ 
+     return do_schedule_messages(
+-        [send_request], sender, read_by_sender=read_by_sender, skip_events=skip_events
++        [send_request],
++        sender,
++        read_by_sender=read_by_sender,
++        skip_events=skip_events,
++        delivery_type=ScheduledMessage.SEND_LATER,
+     )[0]
+ 
+ 
+@@ -73,6 +83,7 @@ def do_schedule_messages(
+     *,
+     read_by_sender: bool = False,
+     skip_events: bool = False,
++    delivery_type: int,
+ ) -> list[int]:
+     scheduled_messages: list[tuple[ScheduledMessage, SendMessageRequest]] = []
+ 
+@@ -93,7 +104,10 @@ def do_schedule_messages(
+         assert send_request.deliver_at is not None
+         scheduled_message.scheduled_timestamp = send_request.deliver_at
+         scheduled_message.read_by_sender = read_by_sender
+-        scheduled_message.delivery_type = ScheduledMessage.SEND_LATER
++        scheduled_message.delivery_type = delivery_type
++
++        if delivery_type == ScheduledMessage.REMIND:
++            scheduled_message.reminder_target_message_id = send_request.reminder_target_message_id
+ 
+         scheduled_messages.append((scheduled_message, send_request))
+ 
+@@ -109,6 +123,7 @@ def do_schedule_messages(
+                 scheduled_message.save(update_fields=["has_attachment"])
+ 
+         if not skip_events:
++            assert delivery_type == ScheduledMessage.SEND_LATER
+             event = {
+                 "type": "scheduled_messages",
+                 "op": "add",
+@@ -153,7 +168,7 @@ def edit_scheduled_message(
+     # If the server failed to send the scheduled message, a new scheduled
+     # delivery timestamp (`deliver_at`) is required.
+     if scheduled_message_object.failed and deliver_at is None:
+-        raise JsonableError(_("Scheduled delivery time must be in the future."))
++        raise DeliveryTimeNotInFutureError
+ 
+     # Get existing scheduled message's recipient IDs and recipient_type_name.
+     existing_recipient, existing_recipient_type_name = get_recipient_ids(
+@@ -270,12 +285,35 @@ def delete_scheduled_message(user_profile: UserProfile, scheduled_message_id: in
+     notify_remove_scheduled_message(user_profile, scheduled_message_id)
+ 
+ 
++def send_reminder(scheduled_message: ScheduledMessage) -> None:
++    message_id = scheduled_message.reminder_target_message_id
++    assert message_id is not None
++    current_user = scheduled_message.sender
++    try:
++        message = access_message(current_user, message_id, is_modifying_message=False)
++        content = get_reminder_formatted_content(message, current_user)
++    except JsonableError:
++        # If we no longer have access to the message, we send the reminder with the
++        # last known message position and content.
++        content = scheduled_message.content
++    # Reminder messages are always sent from the notification bot.
++    message_id = internal_send_private_message(
++        get_system_bot(settings.NOTIFICATION_BOT, scheduled_message.realm.id),
++        current_user,
++        content,
++    )
++    scheduled_message.delivered_message_id = message_id
++    scheduled_message.delivered = True
++    scheduled_message.save(update_fields=["delivered", "delivered_message_id"])
++
++
+ def send_scheduled_message(scheduled_message: ScheduledMessage) -> None:
+     assert not scheduled_message.delivered
+     assert not scheduled_message.failed
+ 
+-    # It's currently not possible to use the reminder feature.
+-    assert scheduled_message.delivery_type == ScheduledMessage.SEND_LATER
++    if scheduled_message.delivery_type == ScheduledMessage.REMIND:
++        send_reminder(scheduled_message)
++        return
+ 
+     # Repeat the checks from validate_account_and_subdomain, in case
+     # the state changed since the message as scheduled.
+@@ -413,6 +451,8 @@ def try_deliver_one_scheduled_message() -> bool:
+ 
+             if (
+                 not was_delivered
++                # Reminders have their own notification system.
++                and scheduled_message.delivery_type != ScheduledMessage.REMIND
+                 # Do not send notification if either the realm or
+                 # the sending user account has been deactivated.
+                 and not isinstance(e, RealmDeactivatedError)
+diff --git a/zerver/lib/exceptions.py b/zerver/lib/exceptions.py
+index 0c154d045929f..a0a0b654f68d3 100644
+--- a/zerver/lib/exceptions.py
++++ b/zerver/lib/exceptions.py
+@@ -766,3 +766,13 @@ def __init__(self) -> None:
+     @override
+     def msg_format() -> str:
+         return _("Email is already in use.")
++
++
++class DeliveryTimeNotInFutureError(JsonableError):
++    def __init__(self) -> None:
++        pass
++
++    @staticmethod
++    @override
++    def msg_format() -> str:
++        return _("Scheduled delivery time must be in the future.")
+diff --git a/zerver/lib/markdown/fenced_code.py b/zerver/lib/markdown/fenced_code.py
+index ba6fc55e1a793..5e6df3fed1199 100644
+--- a/zerver/lib/markdown/fenced_code.py
++++ b/zerver/lib/markdown/fenced_code.py
+@@ -147,6 +147,20 @@ def validate_curl_content(lines: list[str]) -> None:
+ }
+ 
+ 
++# This function is similar to one used in fenced_code.ts
++def get_unused_fence(content: str) -> str:
++    # Define the regular expression pattern to match ``` fences
++    fence_length_re = re.compile(r"^ {0,3}(`{3,})", re.MULTILINE)
++
++    # Initialize the length variable to 3, corresponding to default fence length
++    length = 3
++    matches = fence_length_re.findall(content)
++    for match in matches:
++        length = max(length, len(match) + 1)
++
++    return "`" * length
++
++
+ class FencedCodeExtension(Extension):
+     def __init__(self, config: Mapping[str, Any] = {}) -> None:
+         self.config = {
+diff --git a/zerver/lib/message.py b/zerver/lib/message.py
+index 4370d61d07e08..12f0af90f3c50 100644
+--- a/zerver/lib/message.py
++++ b/zerver/lib/message.py
+@@ -181,6 +181,7 @@ class SendMessageRequest:
+     disable_external_notifications: bool = False
+     automatic_new_visibility_policy: int | None = None
+     recipients_for_user_creation_events: dict[UserProfile, set[int]] | None = None
++    reminder_target_message_id: int | None = None
+ 
+ 
+ # We won't try to fetch more unread message IDs from the database than
+diff --git a/zerver/lib/reminders.py b/zerver/lib/reminders.py
+new file mode 100644
+index 0000000000000..8a02142ddfb26
+--- /dev/null
++++ b/zerver/lib/reminders.py
+@@ -0,0 +1,51 @@
++from django.conf import settings
++from django.utils.translation import gettext as _
++
++from zerver.lib.markdown.fenced_code import get_unused_fence
++from zerver.lib.mention import silent_mention_syntax_for_user
++from zerver.lib.message import truncate_content
++from zerver.lib.message_cache import MessageDict
++from zerver.lib.url_encoding import near_message_url, topic_narrow_url
++from zerver.models import Message, Stream, UserProfile
++
++
++def get_reminder_formatted_content(message: Message, current_user: UserProfile) -> str:
++    if message.is_stream_message():
++        # We don't need to check access here since we already have the message
++        # whose access has already been checked by the caller.
++        stream = Stream.objects.get(
++            id=message.recipient.type_id,
++            realm=current_user.realm,
++        )
++        narrow_link = topic_narrow_url(
++            realm=current_user.realm,
++            stream=stream,
++            topic_name=message.topic_name(),
++        )
++        content = _(
++            "You requested a reminder for the following message sent to [{stream_name} > {topic_name}]({narrow_link})."
++        ).format(
++            stream_name=stream.name,
++            topic_name=message.topic_name(),
++            narrow_link=narrow_link,
++        )
++    else:
++        content = _("You requested a reminder for the following direct message.")
++
++    # Format the message content as a quote.
++    content += "\n\n"
++    content += _("{user_silent_mention} [said]({conversation_url}):").format(
++        user_silent_mention=silent_mention_syntax_for_user(message.sender),
++        conversation_url=near_message_url(current_user.realm, MessageDict.wide_dict(message)),
++    )
++    content += "\n"
++    fence = get_unused_fence(content)
++    quoted_message = "{fence}quote\n{msg_content}\n{fence}"
++    content += quoted_message
++    length_without_message_content = len(content.format(fence=fence, msg_content=""))
++    max_length = settings.MAX_MESSAGE_LENGTH - length_without_message_content
++    msg_content = truncate_content(message.content, max_length, "\n[message truncated]")
++    return content.format(
++        fence=fence,
++        msg_content=msg_content,
++    )
+diff --git a/zerver/migrations/0699_scheduledmessage_reminder_target_message_id.py b/zerver/migrations/0699_scheduledmessage_reminder_target_message_id.py
+new file mode 100644
+index 0000000000000..ac069244d1b93
+--- /dev/null
++++ b/zerver/migrations/0699_scheduledmessage_reminder_target_message_id.py
+@@ -0,0 +1,17 @@
++# Generated by Django 5.1.8 on 2025-04-28 08:16
++
++from django.db import migrations, models
++
++
++class Migration(migrations.Migration):
++    dependencies = [
++        ("zerver", "0698_scheduledmessage_request_timestamp"),
++    ]
++
++    operations = [
++        migrations.AddField(
++            model_name="scheduledmessage",
++            name="reminder_target_message_id",
++            field=models.IntegerField(null=True),
++        ),
++    ]
+diff --git a/zerver/models/scheduled_jobs.py b/zerver/models/scheduled_jobs.py
+index 801d3cb37164e..53ae1a4f8aa3e 100644
+--- a/zerver/models/scheduled_jobs.py
++++ b/zerver/models/scheduled_jobs.py
+@@ -153,6 +153,8 @@ class ScheduledMessage(models.Model):
+     delivered_message = models.ForeignKey(Message, null=True, on_delete=CASCADE)
+     has_attachment = models.BooleanField(default=False, db_index=True)
+     request_timestamp = models.DateTimeField(default=timezone_now)
++    # Only used for REMIND delivery_type messages.
++    reminder_target_message_id = models.IntegerField(null=True)
+ 
+     # Metadata for messages that failed to send when their scheduled
+     # moment arrived.
+diff --git a/zerver/openapi/zulip.yaml b/zerver/openapi/zulip.yaml
+index fc57c112c5212..219bf4aa9a410 100644
+--- a/zerver/openapi/zulip.yaml
++++ b/zerver/openapi/zulip.yaml
+@@ -6560,6 +6560,51 @@ paths:
+                         "result": "error",
+                         "msg": "Saved snippet does not exist.",
+                       }
++  /reminders:
++    post:
++      operationId: create-message-reminder
++      tags: ["reminders"]
++      summary: Create a message reminder
++      description: |
++        Schedule a reminder to be sent to the current user at the specified time. The reminder will link the relevant message.
++
++        **Changes**: New in Zulip 11.0 (feature level ZF-f8d751).
++      requestBody:
++        required: true
++        content:
++          application/x-www-form-urlencoded:
++            schema:
++              type: object
++              properties:
++                message_id:
++                  description: |
++                    The ID of the previously sent message to reference in the reminder message.
++                  type: integer
++                  example: 1
++                scheduled_delivery_timestamp:
++                  type: integer
++                  description: |
++                    The UNIX timestamp for when the reminder will be sent,
++                    in UTC seconds.
++                  example: 5681662420
++      responses:
++        "200":
++          description: Success.
++          content:
++            application/json:
++              schema:
++                allOf:
++                  - $ref: "#/components/schemas/JsonSuccessBase"
++                  - additionalProperties: false
++                    properties:
++                      result: {}
++                      msg: {}
++                      ignored_parameters_unsupported: {}
++                      reminder_id:
++                        type: integer
++                        description: |
++                          Unique ID of the scheduled message reminder.
++                    example: {"msg": "", "reminder_id": 42, "result": "success"}
+   /scheduled_messages:
+     get:
+       operationId: get-scheduled-messages
+diff --git a/zerver/views/reminders.py b/zerver/views/reminders.py
+new file mode 100644
+index 0000000000000..698da573317ab
+--- /dev/null
++++ b/zerver/views/reminders.py
+@@ -0,0 +1,35 @@
++from django.http import HttpRequest, HttpResponse
++from django.utils.timezone import now as timezone_now
++from pydantic import Json
++
++from zerver.actions.reminders import schedule_reminder_for_message
++from zerver.lib.exceptions import DeliveryTimeNotInFutureError
++from zerver.lib.request import RequestNotes
++from zerver.lib.response import json_success
++from zerver.lib.timestamp import timestamp_to_datetime
++from zerver.lib.typed_endpoint import typed_endpoint
++from zerver.models import UserProfile
++
++
++@typed_endpoint
++def create_reminders_message_backend(
++    request: HttpRequest,
++    user_profile: UserProfile,
++    *,
++    message_id: Json[int],
++    scheduled_delivery_timestamp: Json[int],
++) -> HttpResponse:
++    deliver_at = timestamp_to_datetime(scheduled_delivery_timestamp)
++    if deliver_at <= timezone_now():
++        raise DeliveryTimeNotInFutureError
++
++    client = RequestNotes.get_notes(request).client
++    assert client is not None
++
++    reminder_id = schedule_reminder_for_message(
++        user_profile,
++        client,
++        message_id,
++        deliver_at,
++    )
++    return json_success(request, data={"reminder_id": reminder_id})
+diff --git a/zerver/views/scheduled_messages.py b/zerver/views/scheduled_messages.py
+index 538fb027e58bb..644565a232730 100644
+--- a/zerver/views/scheduled_messages.py
++++ b/zerver/views/scheduled_messages.py
+@@ -10,7 +10,7 @@
+     delete_scheduled_message,
+     edit_scheduled_message,
+ )
+-from zerver.lib.exceptions import JsonableError
++from zerver.lib.exceptions import DeliveryTimeNotInFutureError, JsonableError
+ from zerver.lib.recipient_parsing import extract_direct_message_recipient_ids, extract_stream_id
+ from zerver.lib.request import RequestNotes
+ from zerver.lib.response import json_success
+@@ -101,7 +101,7 @@ def update_scheduled_message_backend(
+     if scheduled_delivery_timestamp is not None:
+         deliver_at = timestamp_to_datetime(scheduled_delivery_timestamp)
+         if deliver_at <= timezone_now():
+-            raise JsonableError(_("Scheduled delivery time must be in the future."))
++            raise DeliveryTimeNotInFutureError
+ 
+     sender = user_profile
+     client = RequestNotes.get_notes(request).client
+@@ -151,7 +151,7 @@ def create_scheduled_message_backend(
+ 
+     deliver_at = timestamp_to_datetime(scheduled_delivery_timestamp)
+     if deliver_at <= timezone_now():
+-        raise JsonableError(_("Scheduled delivery time must be in the future."))
++        raise DeliveryTimeNotInFutureError
+ 
+     sender = user_profile
+     client = RequestNotes.get_notes(request).client
+diff --git a/zproject/urls.py b/zproject/urls.py
+index 2b0e34772bbb1..fe4b912400b11 100644
+--- a/zproject/urls.py
++++ b/zproject/urls.py
+@@ -150,6 +150,7 @@
+     realm_register,
+     signup_send_confirm,
+ )
++from zerver.views.reminders import create_reminders_message_backend
+ from zerver.views.report import report_csp_violations
+ from zerver.views.saved_snippets import (
+     create_saved_snippet,
+@@ -353,7 +354,7 @@
+         DELETE=delete_saved_snippet,
+         PATCH=edit_saved_snippet,
+     ),
+-    # New scheduled messages are created via send_message_backend.
++    rest_path("reminders", POST=create_reminders_message_backend),
+     rest_path(
+         "scheduled_messages", GET=fetch_scheduled_messages, POST=create_scheduled_message_backend
+     ),

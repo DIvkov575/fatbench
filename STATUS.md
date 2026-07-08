@@ -2,7 +2,36 @@
 
 ## Where we are
 
-Building the MVP per `LLD.md`: one fat-context task reconstructed from a real Zulip PR.
+MVP complete; now GROWING THE TASK SET. As of 2026-07-08 the benchmark has **3 validated tasks**.
+
+### Task set (all oracle-validated two-sided on the container)
+- **zulip-001** — add `topics_policy` realm setting. Archetype: vertical **invariant propagation**
+  (model→migrations→actions→events→views). Parent `8fb1eeeb09`.
+- **zulip-002** — parallelize export/import (PR #28617). Archetype: horizontal **callsite
+  consolidation** refactor (new `lib/parallel.py` threaded through data_import/export/worker/mgmt).
+  Parent `454905f988`. 8 gate classes; FAIL-side = `ModuleNotFoundError: zerver.lib.parallel`.
+- **zulip-003** — schedule-reminders API (PR #34505). Archetype: diagonal **subsystem reuse**
+  (reuse `ScheduledMessage` delivery machinery). Parent `1af039d8` (+1 migration). 2 gate classes;
+  FAIL-side = `/json/reminders` 404. `ScheduledMessageTest` is regression-as-gate (passes on parent).
+Diversity thesis + full design: `analysis/zulip-002-003-design.md`; writing plan:
+`analysis/zulip-002-003-writing-plan.md`. Built by a Scout→Architect→2×Builder→Validator agent team.
+
+### Two harness follow-ups surfaced while building 002/003
+1. **FIXED — `author.py` parent-commit bug.** `merge_commit_sha^` is wrong for REBASE-merged PRs
+   (returns the PR's own Nth commit). New `_parent_commit` walks N first-parents back from the head
+   (`merge_commit_sha ~ commits`); verified against #28617 (N=11) and #34505 (N=2). NOTE: no API-only
+   heuristic is safe across all merge modes — the authoritative check stays "does the gold diff apply
+   on this parent in a local clone?" (Builders/Validator do this).
+2. **TODO — `ContainerEvaluator` venv/provision handling for newer-than-snapshot parents.** The
+   `fatbench/zulip-provisioned:zulip-001` snapshot venv is stale for 002/003's parents. Each run must:
+   (a) pass `--skip-provision-check` to test-backend, (b) `uv sync --frozen --group dev --inexact`
+   with `VIRTUAL_ENV`/`UV_PROJECT_ENVIRONMENT=/srv/zulip/.venv` before tests (re-sync when switching
+   tasks — lockfiles differ), (c) stage diffs/logs OUTSIDE `/srv/zulip` (git clean wipes it). The
+   evaluator currently does none of these; add before running 002/003 through `harness.run`.
+
+---
+
+## MVP history (below): one fat-context task reconstructed from a real Zulip PR.
 
 ### Done
 - **Step 1 (repo):** Cloned Zulip (blobless) → `repos/zulip`. Verified scale: **416K LOC Python total, 345K in `zerver/`**. Far exceeds the 150K threshold → full context load is infeasible → real retrieval pressure. ✅

@@ -1,0 +1,177 @@
+id: zulip-002
+title: "Factor out ProcessPoolExecutor callsites, download files from S3 in parallel"
+source_pr: "https://github.com/zulip/zulip/pull/28617"
+source_commit: "0ee71c0a6ad067571e8a93ff3e09241b65f67926"
+parent_commit: "454905f98892eb3375eab0405f9b771590d6d46a"
+merged_date: "2025-11-05"            # post knowledge-cutoff — contamination-controlled
+repo: zulip
+language: python
+type: T2                              # cross-callsite abstraction consolidation (refactor)
+tier: hard
+
+# Repo scale (proves retrieval pressure): 416K LOC Python total, 345K in zerver/ backend.
+# Full load infeasible within 1M-token budget — agent must triage.
+
+# --- Parent-commit note (NOT shown to agent) ---
+# PR #28617 was REBASE-MERGED as 11 linear commits (131580f23c..0ee71c0a). The authoring
+# scaler's `merge_commit_sha^` heuristic returned c15f426dc6 — which is the *10th commit of
+# this PR itself* ("parallel: Refactor to provide a callback form"), NOT the pre-PR state.
+# On c15f426 the gold diff does NOT apply (parallel.py already exists there). The true
+# "before" state is the parent of the PR's first commit: 454905f988 ("mattermost_importer:
+# Support converting duplicate channel names"). Verified: on 454905f988 both zerver/lib/
+# parallel.py and zerver/tests/test_parallel.py are absent, and the full gold-backend +
+# gold-tests diffs apply cleanly. parent_commit above is corrected to 454905f988.
+
+description: |
+  Zulip's realm data import and export code paths run several inherently
+  parallelizable, CPU/IO-heavy batches of work — importing message
+  attachments and avatars from third-party services (Slack, Mattermost,
+  RocketChat), exporting a realm's uploaded files and re-encoding exported
+  message data, transferring uploaded files between storage backends, and the
+  background worker that performs deferred export/import work.
+
+  Today much of this work runs serially, and where it does run concurrently
+  the concurrency logic is duplicated — the same worker-process fan-out
+  pattern is copy-pasted independently across these import/export code paths.
+
+  Make this work run concurrently across multiple worker processes rather than
+  serially, and consolidate the duplicated concurrency logic into a single
+  shared helper so that every one of these code paths runs its parallel work
+  through the same primitive. In particular:
+
+  - The shared helper must expose two entry points:
+    - `run_parallel` — run a function over many inputs across a pool of worker
+      processes, yielding results as they complete.
+    - `run_parallel_queue` — a queue-draining variant for producers that feed
+      work items to be processed concurrently (used by the deferred-work
+      background worker).
+    Place this helper in a new module `zerver/lib/parallel.py`.
+  - Correctness across process boundaries: each worker process must NOT reuse a
+    database connection inherited from the parent process — inherited
+    connections must be dropped so each child establishes its own. Getting this
+    wrong causes intermittent, hard-to-reproduce database errors under load.
+  - Every existing import/export/transfer/worker code path that fans work out
+    across processes must be routed through this shared helper; no code path
+    may keep its own private copy of the process-pool logic.
+  - Behavior must be preserved: imports, exports, and file transfers must
+    produce the same results as before — this is a concurrency refactor, not a
+    change in what the operations compute.
+  - Additionally, downloading a realm's uploaded files from S3 during export
+    must happen in parallel rather than one file at a time.
+
+  Scope: BACKEND ONLY. Do not modify `web/` frontend code. The task is judged
+  on backend correctness and on consolidating the duplicated concurrency logic
+  across all affected code paths.
+
+# --- Methodology note (NOT shown to agent) ---
+# The gold tests (zerver/tests/test_parallel.py) import the exact public names
+# `run_parallel`, `run_parallel_queue` (and the internal `_disconnect` helper) from
+# `zerver.lib.parallel`. Because the gold test pins these public surfaces, the prompt is
+# deliberately allowed to name `run_parallel`, `run_parallel_queue`, and the module path
+# `zerver/lib/parallel.py` — the same documented exception as zulip-001. The skill under
+# measurement is NOT "invent an API": it is (1) recognizing that the several independent
+# ProcessPoolExecutor blocks scattered across data_import/, lib/, management/commands/, and
+# worker/ are the SAME pattern and can share one abstraction, (2) designing a primitive whose
+# signature fits every consumer (a parallel map for the importers/exporter AND a
+# queue-draining variant for the worker), (3) handling the fork-safety gotcha (drop the
+# inherited DB connection in each child), and (4) converting EVERY callsite consistently. The
+# prompt does NOT name `ProcessPoolExecutor`, the individual callsites, `_disconnect`, or any
+# of the 12 files — those must be discovered by exploring the repo.
+#
+# ORACLE VALIDITY (important — refactor task, honest caveat):
+#   - test_parallel.py is NEW and imports from the NEW zerver/lib/parallel.py, so on the
+#     unpatched parent it hard-fails with ImportError — a clean SWE-bench-style gate. This is
+#     the PRIMARY correctness gate.
+#   - The six EXISTING importer/export/mgmt test files PASS on the unpatched parent too (it's a
+#     behavior-preserving refactor), so they do NOT discriminate "did nothing" from "did it
+#     right". Their value is REGRESSION-AS-GATE: they fail if the refactor breaks a converted
+#     callsite. Keep completeness/precision as first-class signals — for a consolidation
+#     refactor, "converted all 12 files" IS much of the measured skill.
+
+# --- Gold patch (real merged diff), backend only. No migrations, no docs, no frontend. ---
+gold_patch_files:
+  - zerver/lib/parallel.py                       # NEW — the shared primitive
+  - zerver/lib/export.py
+  - zerver/lib/import_realm.py
+  - zerver/lib/transfer.py
+  - zerver/data_import/import_util.py
+  - zerver/data_import/slack.py
+  - zerver/data_import/mattermost.py
+  - zerver/data_import/rocketchat.py
+  - zerver/management/commands/export.py
+  - zerver/management/commands/export_usermessage_batch.py
+  - zerver/management/commands/convert_slack_data.py
+  - zerver/worker/deferred_work.py
+
+# --- Gate tests (the tests the PR added/changed; applied from gold, run vs agent impl) ---
+gold_test_files:
+  - zerver/tests/test_parallel.py                # NEW — the hard oracle (306 lines)
+  - zerver/tests/test_import_export.py
+  - zerver/tests/test_realm_export.py
+  - zerver/tests/test_slack_importer.py
+  - zerver/tests/test_rocketchat_importer.py
+  - zerver/tests/test_mattermost_importer.py
+  - zerver/tests/test_management_commands.py
+
+gate_tests:
+  # VALIDATED 2026-07-08 on the provisioned container (two-sided oracle):
+  #   PASS (gold-backend+gold-tests): RunParallelTest+RunNotParallelTest = 9 OK; 6 regression-as-
+  #     gate classes = 103 OK; regression command = 149 OK.
+  #   FAIL (gold-tests alone on parent 454905f988): test_parallel -> ModuleNotFoundError
+  #     'zerver.lib.parallel' (clean import-crash gate). The gold-tests diff also rewrote the 6
+  #     existing suites for the new run_parallel/processes= signatures, so they ALSO fail on the
+  #     parent (failures=4, errors=31) — all 8 classes discriminate.
+  # Harness op-note: this parent's deps differ from the snapshot venv -> ContainerEvaluator must
+  # pass `--skip-provision-check` and run `uv sync --frozen --group dev --inexact`
+  # (VIRTUAL_ENV/UV_PROJECT_ENVIRONMENT=/srv/zulip/.venv) before tests; stage files OUTSIDE
+  # /srv/zulip (git clean wipes it). See STATUS.md.
+  # Pinned at CLASS granularity (test-backend runs only module/class labels, never single methods).
+  #
+  # PRIMARY hard gate — imports run_parallel/run_parallel_queue from the new module:
+  - "zerver/tests/test_parallel.py::RunParallelTest"
+  - "zerver/tests/test_parallel.py::RunNotParallelTest"
+  # Regression-as-gate — these PASS on the parent; they catch a BROKEN refactor of a
+  # converted callsite (classes confirmed at parent 454905f988):
+  - "zerver/tests/test_import_export.py::RealmImportExportTest"
+  - "zerver/tests/test_realm_export.py::RealmExportTest"
+  - "zerver/tests/test_slack_importer.py::SlackImporter"
+  - "zerver/tests/test_rocketchat_importer.py::RocketChatImporter"
+  - "zerver/tests/test_mattermost_importer.py::MatterMostImporter"
+  - "zerver/tests/test_management_commands.py::TestExport"
+
+regression_command: |
+  # Scoped backend regression — the import/export/worker suites the refactor could break.
+  ./tools/test-backend zerver.tests.test_parallel zerver.tests.test_import_export \
+    zerver.tests.test_realm_export zerver.tests.test_slack_importer \
+    zerver.tests.test_rocketchat_importer zerver.tests.test_mattermost_importer \
+    zerver.tests.test_management_commands
+
+token_budget: 1200000
+wall_clock_cap_seconds: 2700
+
+# --- Documented at selection time, NOT shown to agent ---
+minimum_reading_set:
+  - zerver/lib/export.py                          # realm exporter — a ProcessPoolExecutor callsite + S3 download loop
+  - zerver/lib/import_realm.py                     # realm importer — another callsite
+  - zerver/lib/transfer.py                         # file-transfer between storage backends — a callsite
+  - zerver/data_import/import_util.py              # shared importer helpers (attachment/avatar fan-out)
+  - zerver/data_import/slack.py                    # one third-party importer callsite (pattern to consolidate)
+  - zerver/worker/deferred_work.py                 # background worker — the queue-draining consumer
+  - "an existing concurrent.futures.ProcessPoolExecutor usage"  # the duplicated pattern to factor out
+  # Subtle requirement: each child process must drop the inherited DB connection (fork-safety);
+  # the new unit test pins this. Must be discovered by reading how callsites use the DB.
+
+red_herrings:
+  - web/src/                                       # any export/import UI — out of scope (backend-only)
+  - zerver/worker/                                 # other queue processors that use threads/asyncio but are NOT the deferred export/import work — must NOT be converted
+  - zerver/lib/queue.py                            # RabbitMQ queue plumbing — unrelated to process-pool fan-out
+  - "unrelated concurrent.futures / threading usages"  # concurrency elsewhere in the codebase that is not import/export
+
+attributes:
+  scatter: high          # 12 files across 4 dirs (lib/data_import/management.commands/worker)
+  snr: low               # ~12 relevant files among hundreds of zerver/*.py
+  red_herrings: medium   # other concurrency usages look convertible but are not in scope
+  inferential_distance: medium  # must infer ONE primitive fits every callsite (map + queue variants)
+  ambiguity: medium      # helper signature constrained by the union of all consumers
+  coupling: wide         # horizontal fan-in — 12 disparate callsites must adopt one abstraction identically
+  spec: under            # outcome + pinned public API specified; the callsite set must be discovered
