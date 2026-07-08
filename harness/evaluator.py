@@ -357,9 +357,9 @@ class RemoteContainerEvaluator(ContainerEvaluator):
     """ContainerEvaluator that drives docker on a remote host over SSH.
 
     The docker daemon, the provisioned snapshot, and the Zulip checkout all live on the remote
-    Amazon Cloud Desktop (see ~/.rbg.conf); the harness runs on macOS. Only the transport
-    changes: every host command is wrapped in `ssh <host> <script>`, and file writes stream over
-    ssh stdin straight into `docker exec -i` — so no temp files on the remote host.
+    Amazon Cloud Desktop (see ~/.rbg.conf); the harness runs on macOS. Commands are wrapped in
+    `ssh <host> <script>` (with transient-failure retry); file writes go via `scp` to a host tmp
+    path + `docker cp` (NOT ssh-stdin, which the WSSH proxy truncates on large payloads).
     """
 
     def __init__(self, host: str, **kwargs):
@@ -392,3 +392,41 @@ class RemoteContainerEvaluator(ContainerEvaluator):
             if not any(m in blob for m in self._TRANSIENT):
                 return proc  # real command failure — don't retry
         return last
+
+    def _put(self, text: str, dest: str) -> None:
+        """Copy a file into the remote container via scp + docker cp (NOT ssh-stdin streaming).
+
+        The WSSH proxy truncates large streamed stdin (observed: an 18KB diff consistently cut to
+        ~7.5KB). So write locally, `scp` to a temp path on the remote HOST, then `docker cp` into
+        the container. Verified by byte-count; retries the whole path on transient transport error.
+        """
+        import os
+        import tempfile
+        want = len(text.encode())
+        base = os.path.basename(dest)
+        remote_tmp = f"/tmp/fatbench_put_{base}"
+        with tempfile.NamedTemporaryFile("w", suffix=".diff", delete=False) as tf:
+            tf.write(text)
+            local_tmp = tf.name
+        try:
+            last = ""
+            for attempt in range(3):
+                scp = subprocess.run(
+                    ["scp", "-q", "-o", "ConnectTimeout=20", local_tmp,
+                     f"{self.host}:{remote_tmp}"],
+                    capture_output=True, text=True,
+                )
+                if scp.returncode == 0:
+                    # host tmp -> container dest, then verify size inside the container.
+                    self._host_sh(f"{self.runtime} cp {remote_tmp} {self.container}:{dest} "
+                                  f"&& rm -f {remote_tmp}")
+                    got = self._exec(
+                        f"wc -c < {shlex.quote(dest)} 2>/dev/null || echo -1").stdout.strip()
+                    if got.isdigit() and int(got) == want:
+                        return
+                    last = f"container file {got} bytes, expected {want}"
+                else:
+                    last = f"scp failed: {scp.stderr.strip()[:200]}"
+            raise RuntimeError(f"failed to stage {dest} after 3 attempts ({last})")
+        finally:
+            os.unlink(local_tmp)
