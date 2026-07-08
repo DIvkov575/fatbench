@@ -187,11 +187,19 @@ class ContainerEvaluator(Evaluator):
 
       setup():     start the container, then start the service stack by hand (the bare container
                    has no init system, so postgres/redis/rabbitmq/memcached don't auto-start).
-      stage():     inside the container: `git reset --hard <parent>` + clean, apply the agent's
-                   impl diff, then overlay the gold test files. We ship diffs (never overwrite
-                   the tree) so the provisioned `.venv`/`var/` survive.
-      run_tests(): `test-backend <class/module labels>` with the venv active; output is written
-                   to a file in the container and read back (survives flaky proxies on long stdout).
+      stage():     inside the container: `git reset --hard <parent>` + clean, RE-SYNC the venv to
+                   the parent's lockfile (see below), apply the agent's impl diff, then overlay the
+                   gold test files. We ship diffs (never overwrite the tree) so `var/` survives and
+                   diffs live in /tmp (outside /srv/zulip, so `git clean` can't wipe them).
+      run_tests(): `test-backend --skip-provision-check <class/module labels>` with the venv
+                   active; output is written to a file and read back (survives flaky proxies).
+
+    Snapshot-vs-parent skew (validated 2026-07-08 on zulip-002/003): the
+    `fatbench/zulip-provisioned:zulip-001` snapshot was provisioned at zulip-001's era, so for a
+    NEWER task parent (a) its `var/provision_version` differs -> test-backend aborts unless
+    `--skip-provision-check`, and (b) its venv lacks that parent's deps -> imports fail unless we
+    `uv sync` to the parent's lockfile first. `stage()` re-syncs after reset (idempotent no-op when
+    the parent already matches the snapshot, e.g. zulip-001).
 
     Local docker. `RemoteContainerEvaluator` overrides the transport to run over SSH.
     """
@@ -199,16 +207,24 @@ class ContainerEvaluator(Evaluator):
     runs_tests = True
     DEFAULT_IMAGE = "fatbench/zulip-provisioned:zulip-001"
     WORKDIR = "/srv/zulip"
+    VENV = "/srv/zulip/.venv"
     SERVICES = ("postgresql", "redis-server", "rabbitmq-server", "memcached")
+    # test-backend flags: skip the provision-version check (snapshot era != task parent era).
+    TEST_BACKEND_FLAGS = "--skip-provision-check"
+    # Re-sync the venv to the checked-out parent's lockfile before running tests.
+    _SYNC_CMD = (f"VIRTUAL_ENV={VENV} UV_PROJECT_ENVIRONMENT={VENV} "
+                 "uv sync --frozen --group dev --inexact")
     _LOG = "/tmp/fatbench_tb.log"
     _RC = "/tmp/fatbench_tb.rc"
 
     def __init__(self, image: str | None = None, runtime: str | None = None,
-                 container_name: str = "fatbench-eval", parent_commit: str | None = None):
+                 container_name: str = "fatbench-eval", parent_commit: str | None = None,
+                 sync_venv: bool = True):
         self.image = image or self.DEFAULT_IMAGE
         self.runtime = runtime
         self.container = container_name
         self.parent_commit = parent_commit
+        self.sync_venv = sync_venv
 
     # --- transport primitives (overridden by the remote subclass) -------------------
     def _host_sh(self, script: str, stdin: str | None = None) -> subprocess.CompletedProcess:
@@ -261,6 +277,11 @@ class ContainerEvaluator(Evaluator):
         )
         if reset.returncode != 0:
             return False, f"reset failed: {reset.stderr.strip()}"
+        # Re-sync the venv to THIS parent's lockfile (snapshot venv may be from a different era).
+        if self.sync_venv:
+            sync = self._exec(f"cd {self.WORKDIR} && {self._SYNC_CMD}")
+            if sync.returncode != 0:
+                return False, f"venv sync failed: {sync.stderr.strip()[-500:]}"
         if impl_diff.strip():
             self._put(impl_diff, "/tmp/impl.diff")
             r = self._exec(f"cd {self.WORKDIR} && git apply /tmp/impl.diff")
@@ -289,9 +310,19 @@ class ContainerEvaluator(Evaluator):
 
     def run_tests(self, workspace_path: Path, test_ids: list[str]) -> TestRunResult:
         dotted = [nodeid_to_dotted(t) for t in test_ids]
-        return self._run_in_env("./tools/test-backend " + " ".join(shlex.quote(d) for d in dotted))
+        return self._run_in_env(
+            f"./tools/test-backend {self.TEST_BACKEND_FLAGS} "
+            + " ".join(shlex.quote(d) for d in dotted)
+        )
 
     def run_command(self, workspace_path: Path, command: str) -> TestRunResult:
+        # Task regression_commands call `./tools/test-backend <modules>` without the
+        # provision-check flag; inject it so they don't abort on a newer-than-snapshot parent.
+        # (Harness concern, not the task author's — keeps YAMLs portable across snapshot eras.)
+        if "test-backend" in command and self.TEST_BACKEND_FLAGS not in command:
+            command = command.replace(
+                "./tools/test-backend", f"./tools/test-backend {self.TEST_BACKEND_FLAGS}", 1
+            )
         return self._run_in_env(command)
 
     def teardown(self) -> None:

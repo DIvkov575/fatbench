@@ -126,13 +126,67 @@ def test_stage_applies_impl_then_gold(monkeypatch):
     monkeypatch.setattr(ev, "_host_sh", fake_host_sh)
     ok, msg = ev.stage("IMPL_DIFF", "GOLD_DIFF")
     assert ok, msg
-    joined = "\n".join(c[1] for c in calls)
-    # reset to parent happens, both diffs are cat'd in and applied
+    scripts = [c[1] for c in calls]
+    joined = "\n".join(scripts)
+    # reset to parent happens, venv re-syncs, then both diffs are cat'd in and applied
     assert "git reset --hard abc123" in joined
+    assert "uv sync --frozen --group dev --inexact" in joined
     assert "git apply /tmp/impl.diff" in joined
     assert "git apply /tmp/gold-tests.diff" in joined
     stdins = [c[2] for c in calls if c[2]]
     assert "IMPL_DIFF" in stdins and "GOLD_DIFF" in stdins
+    # ordering: reset -> sync -> impl apply
+    reset_i = next(i for i, s in enumerate(scripts) if "git reset" in s)
+    sync_i = next(i for i, s in enumerate(scripts) if "uv sync" in s)
+    impl_i = next(i for i, s in enumerate(scripts) if "git apply /tmp/impl.diff" in s)
+    assert reset_i < sync_i < impl_i
+
+
+def test_stage_sync_can_be_disabled():
+    ev = ContainerEvaluator(parent_commit="abc123", sync_venv=False)
+    ev.runtime = "docker"
+    calls = []
+    ev._host_sh = lambda script, stdin=None: (calls.append(script) or _FakeProc(returncode=0))
+    ok, _ = ev.stage("IMPL", "")
+    assert ok and not any("uv sync" in c for c in calls)
+
+
+def test_stage_fails_if_sync_fails():
+    ev = ContainerEvaluator(parent_commit="abc123")
+    ev.runtime = "docker"
+
+    def fake(script, stdin=None):
+        rc = 1 if "uv sync" in script else 0
+        return _FakeProc(stderr="lockfile mismatch" if rc else "", returncode=rc)
+
+    ev._host_sh = fake
+    ok, msg = ev.stage("IMPL", "GOLD")
+    assert not ok and "venv sync failed" in msg
+
+
+def test_run_tests_passes_skip_provision_check(monkeypatch):
+    ev = ContainerEvaluator(parent_commit="abc123")
+    ev.runtime = "docker"
+    seen = {}
+    monkeypatch.setattr(ev, "_run_in_env", lambda inner: seen.setdefault("inner", inner) or
+                        __import__("harness.evaluator", fromlist=["TestRunResult"]).TestRunResult(
+                            ran=True, passed=1, failed=0, total=1, ok=True))
+    ev.run_tests(Path("/x"), ["zerver/tests/test_realm.py::RealmAPITest"])
+    assert "--skip-provision-check" in seen["inner"]
+    assert "test_realm.RealmAPITest" in seen["inner"]
+
+
+def test_run_command_injects_skip_provision_check():
+    ev = ContainerEvaluator(parent_commit="abc123")
+    ev.runtime = "docker"
+    seen = {}
+    ev._run_in_env = lambda inner: seen.setdefault("inner", inner)
+    ev.run_command(Path("/x"), "./tools/test-backend zerver.tests.test_realm")
+    assert "./tools/test-backend --skip-provision-check zerver.tests.test_realm" in seen["inner"]
+    # non-test-backend commands pass through untouched
+    seen.clear()
+    ev.run_command(Path("/x"), "echo hi")
+    assert seen["inner"] == "echo hi"
 
 
 def test_stage_fails_without_parent_commit():
