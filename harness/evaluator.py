@@ -417,9 +417,13 @@ class RemoteContainerEvaluator(ContainerEvaluator):
                     capture_output=True, text=True,
                 )
                 if scp.returncode == 0:
-                    # host tmp -> container dest, then verify size inside the container.
+                    # host tmp -> container dest. `docker cp` preserves the host uid (34727450)
+                    # and 0600 mode, so the container's `github` user can't read it — chmod as
+                    # root afterwards. Then verify size inside the container (as github).
                     self._host_sh(f"{self.runtime} cp {remote_tmp} {self.container}:{dest} "
                                   f"&& rm -f {remote_tmp}")
+                    self._host_sh(f"{self.runtime} exec -u root {self.container} "
+                                  f"chmod 644 {shlex.quote(dest)}")
                     got = self._exec(
                         f"wc -c < {shlex.quote(dest)} 2>/dev/null || echo -1").stdout.strip()
                     if got.isdigit() and int(got) == want:
