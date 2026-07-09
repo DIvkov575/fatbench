@@ -1,17 +1,16 @@
 """FatBench harness orchestrator.
 
-Run one agent on one task with a given context, score it, write results. A test is
-(task, context) -> score. Context is a CLAUDE.md you supply, or nothing.
+Run one test: invoke an agent on a task, collect its diff, score it.
 
-    # no injected context:
-    python -m harness.run --task tasks/zulip-001.yaml
-    # with a CLAUDE.md (any context the user wants to test):
-    python -m harness.run --task tasks/zulip-001.yaml --claude-md path/to/some.CLAUDE.md
-    # variants:
+    python -m harness.run --task tasks/zulip-001.yaml --remote-host <host>
     python -m harness.run --task ... --no-tests   # file metrics only (no container)
-    python -m harness.run --task ... --dry-run     # set up + score gold, skip the agent
+    python -m harness.run --task ... --dry-run     # score the gold diff, skip the agent
 
-Pipeline (spec §Pipeline): set up -> ask -> collect -> grade -> record.
+The harness does NOT inject, configure, or model the agent's environment. Whatever claude -p
+picks up from the user's setup (CLAUDE.md, plugins, MCP, hooks) is what gets measured. The
+harness just invokes, collects, and scores.
+
+Pipeline: set up workspace -> invoke agent -> collect diff -> grade -> record.
 """
 
 from __future__ import annotations
@@ -26,7 +25,6 @@ from pathlib import Path
 from . import agent as agent_mod
 from . import diffutil, scorer
 from . import workspace as ws_mod
-from .config import Config, load_config
 from .evaluator import (
     ContainerEvaluator,
     Evaluator,
@@ -65,10 +63,8 @@ def pick_evaluator(no_tests: bool, image: str | None, remote_host: str | None,
 
 def run(
     task_path: str,
-    config_path: str | None = None,
     *,
-    claude_md_path: str | None = None,
-    experiment_name: str | None = None,
+    name: str = "run",
     no_tests: bool = False,
     dry_run: bool = False,
     results_root: Path | None = None,
@@ -78,22 +74,12 @@ def run(
     keep_workspace: bool = False,
 ) -> dict:
     task = load_task(task_path)
-    # Resolve the run's injected context:
-    #   --claude-md PATH  -> bring-your-own CLAUDE.md (no YAML needed)
-    #   --config YAML     -> context defined in a config file
-    #   neither           -> inject nothing (labeled `no-context`)
-    if claude_md_path:
-        config = Config.from_claude_md(claude_md_path, name=experiment_name)
-    elif config_path:
-        config = load_config(config_path)
-    else:
-        config = Config.none()
     tasks_dir = Path(task_path).resolve().parent
     results_root = results_root or (REPO_ROOT / "results")
 
     repo_path = Path(repo_override) if repo_override else (REPO_ROOT / "repos" / task.repo)
 
-    run_id = f"{_now_stamp()}_{task.id}_{config.name}"
+    run_id = f"{_now_stamp()}_{task.id}_{name}"
     out_dir = results_root / run_id / task.id
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -101,9 +87,6 @@ def run(
     work = ws_mod.create_workspace(repo_path, task.parent_commit)
     agent_result = None
     try:
-        if config.writes_claude_md:
-            work.write_claude_md(config.claude_md)
-
         # 2. ASK + 3. COLLECT -------------------------------------------------
         if dry_run:
             # Score the gold backend diff as a sanity oracle instead of invoking the agent.
@@ -112,7 +95,7 @@ def run(
             agent_result = agent_mod.invoke_claude_code(
                 work.path, task.description, timeout_seconds=task.wall_clock_cap_seconds,
             )
-            agent_diff = work.collect_diff(exclude_claude_md=True)
+            agent_diff = work.collect_diff()
 
         (out_dir / "patch.diff").write_text(agent_diff)
         if agent_result is not None:
@@ -177,7 +160,7 @@ def run(
         meta = {
             "run_id": run_id,
             "task": task.id,
-            "config": config.name,
+            "name": name,
             "parent_commit": task.parent_commit,
             "dry_run": dry_run,
             "tests_ran": gate_result.ran,
@@ -213,18 +196,9 @@ def _agent_meta(agent_result) -> dict | None:
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(
-        description="FatBench: run one task with a given context and score it. "
-                    "Supply a CLAUDE.md with --claude-md, or omit it to inject nothing.")
+        description="FatBench: run one test — invoke an agent on a task, score it.")
     ap.add_argument("--task", required=True, help="path to tasks/<id>.yaml")
-    # The run's injected context. None of these -> inject nothing.
-    ap.add_argument("--claude-md", default=None,
-                    help="inject this CLAUDE.md into the agent's workspace "
-                         "(e.g. examples/experiments/*.CLAUDE.md). Mutually exclusive with --config.")
-    ap.add_argument("--config", default=None,
-                    help="context config YAML (claude_md/claude_md_file). Omit both this and "
-                         "--claude-md to inject nothing.")
-    ap.add_argument("--experiment-name", default=None,
-                    help="label for the results dir when using --claude-md (default: file stem)")
+    ap.add_argument("--name", default="run", help="label for the results dir (default: 'run')")
     ap.add_argument("--no-tests", action="store_true",
                     help="skip test execution (file metrics only)")
     ap.add_argument("--dry-run", action="store_true",
@@ -233,17 +207,13 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--repo", default=None, help="override repo path (default: repos/<task.repo>)")
     ap.add_argument("--image", default=None, help="override container image")
     ap.add_argument("--remote-host", default=None,
-                    help="drive docker on this host over SSH (e.g. the Cloud Desktop in ~/.rbg.conf)")
+                    help="drive docker on this host over SSH (e.g. the Cloud Desktop)")
     ap.add_argument("--keep-workspace", action="store_true", help="don't delete the temp workspace")
     args = ap.parse_args(argv)
 
-    if args.claude_md and args.config:
-        ap.error("--claude-md and --config are mutually exclusive (both define the run's context)")
-
     summary = run(
-        args.task, args.config,
-        claude_md_path=args.claude_md, experiment_name=args.experiment_name,
-        no_tests=args.no_tests, dry_run=args.dry_run,
+        args.task,
+        name=args.name, no_tests=args.no_tests, dry_run=args.dry_run,
         results_root=Path(args.results) if args.results else None,
         repo_override=args.repo, image=args.image, remote_host=args.remote_host,
         keep_workspace=args.keep_workspace,

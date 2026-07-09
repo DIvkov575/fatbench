@@ -1,8 +1,9 @@
 """Invoke the Claude Code agent on a task, in a workspace.
 
 We run `claude -p <prompt> --output-format json` from the workspace dir so the agent sees the
-repo (and any injected CLAUDE.md) exactly as in normal use. The task description is the ONLY
-input — no file hints, no gold info (LLD.md §6 adapter constraint).
+repo exactly as in normal use — whatever environment the user has (CLAUDE.md, plugins, MCP,
+hooks) is what gets tested. The task description is the only harness-provided input; everything
+else is the user's environment. No file hints, no gold info (LLD.md §6 adapter constraint).
 
 The JSON envelope (probed) provides: result, is_error, num_turns, duration_ms, total_cost_usd,
 and usage.{input_tokens, output_tokens, cache_creation_input_tokens, cache_read_input_tokens}.
@@ -43,30 +44,18 @@ def invoke_claude_code(
     timeout_seconds: int,
     extra_args: list[str] | None = None,
     claude_bin: str = "claude",
-    isolate: bool = True,
 ) -> AgentResult:
     """Run `claude -p` on the task.
 
-    `isolate=True` (default) adds `--strict-mcp-config` so NO MCP servers load — the agent gets
-    plain Claude Code + the repo + the task prompt, with none of the host's user-level MCP
-    "plugins". This keeps the benchmark measuring the model's own fat-context ability, not
-    whatever MCP tooling a given machine happens to have installed, and it applies IDENTICALLY
-    across runs so the only thing that varies is the injected CLAUDE.md (a run may inject none).
-    NOTE: a test that specifically wants MCP servers present would run with isolate=False — the
-    platform measures whatever context the user supplies.
-
-    Deliberately NOT using `--bare`: verified (2026-07-07) that `--bare` also suppresses the
-    *workspace's own* CLAUDE.md, which would silently disable an experiment's injected onboarding
-    doc and confound the comparison. `--setting-sources project,local` was also rejected — it drops
-    the `user` source where OAuth lives and breaks auth (403). `--strict-mcp-config` alone keeps
-    auth + reads the workspace CLAUDE.md while removing MCP servers — exactly what we want.
+    The harness does NOT configure the agent's environment. Whatever the user has set up
+    (CLAUDE.md in the workspace, plugins, MCP servers, hooks, settings) is what gets measured.
+    The harness just invokes, collects the diff, and scores it.
     """
     workspace_path = Path(workspace_path)
     args = [
         claude_bin, "-p", prompt,
         "--output-format", "json",
         "--dangerously-skip-permissions",
-        *(["--strict-mcp-config"] if isolate else []),
         *(extra_args or []),
     ]
 
