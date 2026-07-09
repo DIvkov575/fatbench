@@ -1,16 +1,14 @@
-"""Load a run config: what experiment context (if any) the agent gets.
+"""The context injected into a run.
 
-FatBench is a benchmarking PLATFORM. The built-in control is `baseline` — vanilla Claude Code
-with only the task prompt + the raw repo, no injected context. An EXPERIMENT is whatever a user
-brings to test against that control: most commonly a `CLAUDE.md` (onboarding/instructions), but
-the platform is agnostic about what's inside it.
+FatBench runs a test: (task, context) -> score. `context` is whatever you put in front of the
+agent — most commonly a `CLAUDE.md`, but the platform is agnostic. There is no privileged
+"baseline"/"control" run: injecting nothing is simply one possible context, not a reference point.
+If you want to compare two setups, run two tests and diff the scores yourself.
 
-Two ways to specify the experiment's CLAUDE.md:
+Two ways to specify a run's context:
   1. `--claude-md PATH` on the CLI (bring-your-own; no YAML needed), or
   2. a config YAML with `claude_md:` (inline) or `claude_md_file:` (path relative to the YAML).
-
-`baseline` (claude_md=None) is the only config the platform ships; experiment configs/docs live
-with the user (see `examples/experiments/` for a sample).
+Omit both and the run injects no context (labeled `no-context`).
 """
 
 from __future__ import annotations
@@ -24,20 +22,20 @@ import yaml
 @dataclass
 class Config:
     name: str
-    claude_md: str | None  # CLAUDE.md content to inject, or None for the vanilla baseline
+    claude_md: str | None  # CLAUDE.md content to inject, or None to inject nothing
 
     @property
     def writes_claude_md(self) -> bool:
         return bool(self.claude_md)
 
     @classmethod
-    def baseline(cls) -> "Config":
-        """The built-in vanilla control: no injected context."""
-        return cls(name="baseline", claude_md=None)
+    def none(cls) -> "Config":
+        """A run with no injected context."""
+        return cls(name="no-context", claude_md=None)
 
     @classmethod
     def from_claude_md(cls, md_path: str | Path, name: str | None = None) -> "Config":
-        """Build an experiment config directly from a CLAUDE.md file (bring-your-own)."""
+        """Build a run's context directly from a CLAUDE.md file (bring-your-own)."""
         md_path = Path(md_path)
         content = md_path.read_text()
         # Derive a clean label: strip .md and a trailing .CLAUDE (e.g. "exp.CLAUDE.md" -> "exp").
@@ -59,6 +57,6 @@ def load_config(path: str | Path) -> Config:
         claude_md = md_path.read_text()
 
     if claude_md is not None and not str(claude_md).strip():
-        claude_md = None  # treat empty string as baseline
+        claude_md = None  # empty content -> no injected context
 
     return Config(name=name, claude_md=claude_md)

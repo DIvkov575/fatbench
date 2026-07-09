@@ -21,26 +21,19 @@ def test_load_zulip_task():
     assert "zerver/models/realms.py" not in t.description
 
 
-def test_baseline_config_no_claude_md():
-    c = load_config(ROOT / "configs" / "baseline.yaml")
-    assert c.name == "baseline"
-    assert c.claude_md is None
-    assert not c.writes_claude_md
+def test_no_context_run_injects_nothing():
+    c = Config.none()
+    assert c.name == "no-context" and c.claude_md is None and not c.writes_claude_md
 
 
-def test_baseline_factory_is_vanilla():
-    c = Config.baseline()
-    assert c.name == "baseline" and c.claude_md is None and not c.writes_claude_md
-
-
-def test_bring_your_own_experiment_from_claude_md():
-    # The platform ships no experiment configs; a user brings a CLAUDE.md. Sample lives in examples/.
+def test_bring_your_own_context_from_claude_md():
+    # The platform ships no context configs; a user brings a CLAUDE.md. Sample lives in examples/.
     md = ROOT / "examples" / "experiments" / "zulip-backend-onboarding.CLAUDE.md"
     c = Config.from_claude_md(md)
     assert c.name == "zulip-backend-onboarding"
     assert c.writes_claude_md
     assert "test-backend" in c.claude_md
-    # A well-formed experiment doc must NOT leak a specific task's solution (e.g. the setting name).
+    # A well-formed context doc must NOT leak a specific task's solution (e.g. the setting name).
     assert "topics_policy" not in c.claude_md
     # explicit name override
     assert Config.from_claude_md(md, name="exp-A").name == "exp-A"

@@ -51,9 +51,9 @@ def invoke_claude_code(
     plain Claude Code + the repo + the task prompt, with none of the host's user-level MCP
     "plugins". This keeps the benchmark measuring the model's own fat-context ability, not
     whatever MCP tooling a given machine happens to have installed, and it applies IDENTICALLY
-    to every arm so the only variable is the experiment's injected CLAUDE.md (baseline injects
-    none). NOTE: an experiment that specifically wants to test MCP servers would run with
-    isolate=False — the platform measures whatever the user brings.
+    across runs so the only thing that varies is the injected CLAUDE.md (a run may inject none).
+    NOTE: a test that specifically wants MCP servers present would run with isolate=False — the
+    platform measures whatever context the user supplies.
 
     Deliberately NOT using `--bare`: verified (2026-07-07) that `--bare` also suppresses the
     *workspace's own* CLAUDE.md, which would silently disable an experiment's injected onboarding

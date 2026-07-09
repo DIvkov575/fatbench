@@ -1,12 +1,12 @@
 """FatBench harness orchestrator.
 
-Run one agent on one task under one ARM, score it, write results. The arm is either the
-built-in vanilla `baseline` (default) or a user-supplied experiment (a CLAUDE.md / config).
+Run one agent on one task with a given context, score it, write results. A test is
+(task, context) -> score. Context is a CLAUDE.md you supply, or nothing.
 
-    # vanilla baseline (built-in control):
+    # no injected context:
     python -m harness.run --task tasks/zulip-001.yaml
-    # bring-your-own experiment (any CLAUDE.md the user wants to test):
-    python -m harness.run --task tasks/zulip-001.yaml --claude-md path/to/EXPERIMENT.CLAUDE.md
+    # with a CLAUDE.md (any context the user wants to test):
+    python -m harness.run --task tasks/zulip-001.yaml --claude-md path/to/some.CLAUDE.md
     # variants:
     python -m harness.run --task ... --no-tests   # file metrics only (no container)
     python -m harness.run --task ... --dry-run     # set up + score gold, skip the agent
@@ -78,16 +78,16 @@ def run(
     keep_workspace: bool = False,
 ) -> dict:
     task = load_task(task_path)
-    # Resolve the arm being measured:
-    #   --claude-md PATH  -> bring-your-own experiment (no YAML needed)
-    #   --config YAML     -> experiment defined in a config file
-    #   neither           -> the built-in vanilla `baseline` control
+    # Resolve the run's injected context:
+    #   --claude-md PATH  -> bring-your-own CLAUDE.md (no YAML needed)
+    #   --config YAML     -> context defined in a config file
+    #   neither           -> inject nothing (labeled `no-context`)
     if claude_md_path:
         config = Config.from_claude_md(claude_md_path, name=experiment_name)
     elif config_path:
         config = load_config(config_path)
     else:
-        config = Config.baseline()
+        config = Config.none()
     tasks_dir = Path(task_path).resolve().parent
     results_root = results_root or (REPO_ROOT / "results")
 
@@ -213,19 +213,18 @@ def _agent_meta(agent_result) -> dict | None:
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(
-        description="FatBench: run one task under one arm and score it. "
-                    "Default arm is the vanilla `baseline`; bring an experiment with --claude-md.")
+        description="FatBench: run one task with a given context and score it. "
+                    "Supply a CLAUDE.md with --claude-md, or omit it to inject nothing.")
     ap.add_argument("--task", required=True, help="path to tasks/<id>.yaml")
-    # The arm under test. None of these -> the built-in vanilla baseline control.
+    # The run's injected context. None of these -> inject nothing.
     ap.add_argument("--claude-md", default=None,
-                    help="EXPERIMENT: inject this CLAUDE.md into the agent's workspace "
-                         "(bring-your-own; e.g. examples/experiments/*.CLAUDE.md). Mutually "
-                         "exclusive with --config.")
+                    help="inject this CLAUDE.md into the agent's workspace "
+                         "(e.g. examples/experiments/*.CLAUDE.md). Mutually exclusive with --config.")
     ap.add_argument("--config", default=None,
-                    help="experiment config YAML (claude_md/claude_md_file). Omit both this and "
-                         "--claude-md to run the vanilla baseline.")
+                    help="context config YAML (claude_md/claude_md_file). Omit both this and "
+                         "--claude-md to inject nothing.")
     ap.add_argument("--experiment-name", default=None,
-                    help="label for results dir when using --claude-md (default: file stem)")
+                    help="label for the results dir when using --claude-md (default: file stem)")
     ap.add_argument("--no-tests", action="store_true",
                     help="skip test execution (file metrics only)")
     ap.add_argument("--dry-run", action="store_true",
@@ -239,7 +238,7 @@ def main(argv: list[str] | None = None) -> int:
     args = ap.parse_args(argv)
 
     if args.claude_md and args.config:
-        ap.error("--claude-md and --config are mutually exclusive (both define the experiment arm)")
+        ap.error("--claude-md and --config are mutually exclusive (both define the run's context)")
 
     summary = run(
         args.task, args.config,
