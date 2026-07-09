@@ -121,15 +121,20 @@ uid 1001) — copy the repo *into* the image and `chown -R github`; (2) the bare
 init system, so start `postgresql/redis-server/rabbitmq-server/memcached` by hand before tests.
 Fallback repo if Zulip's env ever fights us: `dbt-core` (simpler deps), per `LLD.md` §10.
 
-## Harness (to be built — `LLD.md` §6)
+## Harness (`LLD.md` §6)
 
-`harness/run.py` (single-file MVP) will: check out the parent commit into a fresh workspace,
-optionally write a config's `CLAUDE.md`, invoke `claude -p --dangerously-skip-permissions` with the
-task prompt, collect the resulting diff + token usage, apply it, overlay the gold test files, run
-gates + regression, and emit scores. Configs under `configs/` are A/B variants — at minimum
-`baseline` (no CLAUDE.md) vs `full-harness` (a Zulip onboarding CLAUDE.md). The MVP comparison is
-the first measurement, not the hypothesis being tested: the MVP validates that the *instrument*
-produces discriminating, reproducible scores.
+`harness/run.py` checks out the parent commit into a fresh workspace, optionally injects an
+experiment's `CLAUDE.md`, invokes `claude -p --dangerously-skip-permissions` with the task prompt,
+collects the resulting diff + token usage, applies it, overlays the gold test files, runs gates +
+regression, and emits scores.
+
+**FatBench is a benchmarking platform, not one experiment.** The platform ships exactly one arm:
+the vanilla `baseline` control (`configs/baseline.yaml` — no injected context; run it by simply
+omitting `--config`/`--claude-md`). Everything you'd want to *test* against that control — a
+CLAUDE.md, plugins, MCP servers, hooks — is an **experiment the user brings**: `--claude-md PATH`
+(or a config YAML with `claude_md`/`claude_md_file`). See `examples/experiments/` for a sample
+(a Zulip onboarding doc) and the rules for a valid, non-leaking experiment doc. Do NOT re-add a
+built-in experiment config to the platform.
 
 **Adapter constraint:** the agent must get no information it wouldn't have in real use. The task
 description is the only input; everything else is discovered by exploring the repo. Hooks/plugins/

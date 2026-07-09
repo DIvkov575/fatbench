@@ -4,6 +4,15 @@
 
 MVP complete; now GROWING THE TASK SET. As of 2026-07-08 the benchmark has **3 validated tasks**.
 
+### Platform reframe (2026-07-09)
+FatBench is a benchmarking **platform**, not one experiment. It ships tasks + oracle + scorer + a
+single built-in control arm: the vanilla `baseline` (no injected context). The thing under test —
+a CLAUDE.md / plugins / MCP / hooks — is an **experiment the user brings**, via `--claude-md PATH`
+(or a config YAML). Run the baseline by omitting both flags. The old shipped `full-harness` config
+was removed; its onboarding CLAUDE.md now lives as a *sample experiment* in
+`examples/experiments/zulip-backend-onboarding.CLAUDE.md` (+ README with the "valid experiment doc"
+rules). `configs/` now holds only `baseline.yaml`. 46 unit tests pass.
+
 ### Task set (all oracle-validated two-sided on the container)
 - **zulip-001** — add `topics_policy` realm setting. Archetype: vertical **invariant propagation**
   (model→migrations→actions→events→views). Parent `8fb1eeeb09`.

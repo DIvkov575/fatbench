@@ -1,10 +1,15 @@
 """FatBench harness orchestrator.
 
-Run one agent on one task under one config, score it, write results.
+Run one agent on one task under one ARM, score it, write results. The arm is either the
+built-in vanilla `baseline` (default) or a user-supplied experiment (a CLAUDE.md / config).
 
-    python -m harness.run --task tasks/zulip-001.yaml --config configs/baseline.yaml
-    python -m harness.run --task ... --config ... --no-tests   # file metrics only (this host)
-    python -m harness.run --task ... --config ... --dry-run     # set up + score gold, skip agent
+    # vanilla baseline (built-in control):
+    python -m harness.run --task tasks/zulip-001.yaml
+    # bring-your-own experiment (any CLAUDE.md the user wants to test):
+    python -m harness.run --task tasks/zulip-001.yaml --claude-md path/to/EXPERIMENT.CLAUDE.md
+    # variants:
+    python -m harness.run --task ... --no-tests   # file metrics only (no container)
+    python -m harness.run --task ... --dry-run     # set up + score gold, skip the agent
 
 Pipeline (spec §Pipeline): set up -> ask -> collect -> grade -> record.
 """
@@ -21,7 +26,7 @@ from pathlib import Path
 from . import agent as agent_mod
 from . import diffutil, scorer
 from . import workspace as ws_mod
-from .config import load_config
+from .config import Config, load_config
 from .evaluator import (
     ContainerEvaluator,
     Evaluator,
@@ -60,8 +65,10 @@ def pick_evaluator(no_tests: bool, image: str | None, remote_host: str | None,
 
 def run(
     task_path: str,
-    config_path: str,
+    config_path: str | None = None,
     *,
+    claude_md_path: str | None = None,
+    experiment_name: str | None = None,
     no_tests: bool = False,
     dry_run: bool = False,
     results_root: Path | None = None,
@@ -71,7 +78,16 @@ def run(
     keep_workspace: bool = False,
 ) -> dict:
     task = load_task(task_path)
-    config = load_config(config_path)
+    # Resolve the arm being measured:
+    #   --claude-md PATH  -> bring-your-own experiment (no YAML needed)
+    #   --config YAML     -> experiment defined in a config file
+    #   neither           -> the built-in vanilla `baseline` control
+    if claude_md_path:
+        config = Config.from_claude_md(claude_md_path, name=experiment_name)
+    elif config_path:
+        config = load_config(config_path)
+    else:
+        config = Config.baseline()
     tasks_dir = Path(task_path).resolve().parent
     results_root = results_root or (REPO_ROOT / "results")
 
@@ -196,9 +212,20 @@ def _agent_meta(agent_result) -> dict | None:
 
 
 def main(argv: list[str] | None = None) -> int:
-    ap = argparse.ArgumentParser(description="FatBench harness: run + score one (task, config).")
+    ap = argparse.ArgumentParser(
+        description="FatBench: run one task under one arm and score it. "
+                    "Default arm is the vanilla `baseline`; bring an experiment with --claude-md.")
     ap.add_argument("--task", required=True, help="path to tasks/<id>.yaml")
-    ap.add_argument("--config", required=True, help="path to configs/<name>.yaml")
+    # The arm under test. None of these -> the built-in vanilla baseline control.
+    ap.add_argument("--claude-md", default=None,
+                    help="EXPERIMENT: inject this CLAUDE.md into the agent's workspace "
+                         "(bring-your-own; e.g. examples/experiments/*.CLAUDE.md). Mutually "
+                         "exclusive with --config.")
+    ap.add_argument("--config", default=None,
+                    help="experiment config YAML (claude_md/claude_md_file). Omit both this and "
+                         "--claude-md to run the vanilla baseline.")
+    ap.add_argument("--experiment-name", default=None,
+                    help="label for results dir when using --claude-md (default: file stem)")
     ap.add_argument("--no-tests", action="store_true",
                     help="skip test execution (file metrics only)")
     ap.add_argument("--dry-run", action="store_true",
@@ -211,8 +238,12 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--keep-workspace", action="store_true", help="don't delete the temp workspace")
     args = ap.parse_args(argv)
 
+    if args.claude_md and args.config:
+        ap.error("--claude-md and --config are mutually exclusive (both define the experiment arm)")
+
     summary = run(
         args.task, args.config,
+        claude_md_path=args.claude_md, experiment_name=args.experiment_name,
         no_tests=args.no_tests, dry_run=args.dry_run,
         results_root=Path(args.results) if args.results else None,
         repo_override=args.repo, image=args.image, remote_host=args.remote_host,

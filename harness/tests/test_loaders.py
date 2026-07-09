@@ -2,7 +2,7 @@
 
 from pathlib import Path
 
-from harness.config import load_config
+from harness.config import Config, load_config
 from harness.task import load_task
 
 ROOT = Path(__file__).resolve().parent.parent.parent
@@ -28,10 +28,19 @@ def test_baseline_config_no_claude_md():
     assert not c.writes_claude_md
 
 
-def test_full_harness_config_loads_external_md():
-    c = load_config(ROOT / "configs" / "full-harness.yaml")
-    assert c.name == "full-harness"
+def test_baseline_factory_is_vanilla():
+    c = Config.baseline()
+    assert c.name == "baseline" and c.claude_md is None and not c.writes_claude_md
+
+
+def test_bring_your_own_experiment_from_claude_md():
+    # The platform ships no experiment configs; a user brings a CLAUDE.md. Sample lives in examples/.
+    md = ROOT / "examples" / "experiments" / "zulip-backend-onboarding.CLAUDE.md"
+    c = Config.from_claude_md(md)
+    assert c.name == "zulip-backend-onboarding"
     assert c.writes_claude_md
     assert "test-backend" in c.claude_md
-    # The harness CLAUDE.md must NOT leak the task's specific setting name.
+    # A well-formed experiment doc must NOT leak a specific task's solution (e.g. the setting name).
     assert "topics_policy" not in c.claude_md
+    # explicit name override
+    assert Config.from_claude_md(md, name="exp-A").name == "exp-A"
