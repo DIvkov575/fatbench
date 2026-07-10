@@ -99,6 +99,19 @@ regression_command: |
 token_budget: 1200000
 wall_clock_cap_seconds: 2700
 
+# --- Context bloat (efficiency knob; NOT shown to agent, NEVER reaches the oracle) ---
+# Off-solution-path files inflated with verbose filler in the agent's workspace so its
+# greps/reads burn tokens; reverted to pristine parent content before scoring. These are the
+# realm/stream-setting lookalikes + large same-dir siblings the agent will naturally read while
+# hunting for the real target. None are gold or test files (loader enforces this).
+bloat_tokens_per_file: 8000
+bloat_files:
+  - zerver/lib/streams.py
+  - zerver/models/streams.py
+  - zerver/actions/streams.py
+  - zerver/lib/export.py
+  - zerver/views/registration.py
+
 # --- Documented at selection time, NOT shown to agent ---
 minimum_reading_set:
   - zerver/models/realms.py                 # where realm settings + enums live; mandatory_topics field

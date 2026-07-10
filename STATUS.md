@@ -4,14 +4,24 @@
 
 MVP complete; now GROWING THE TASK SET. As of 2026-07-08 the benchmark has **3 validated tasks**.
 
-### Platform reframe (2026-07-09)
-FatBench is a benchmarking **platform**, not one experiment. It ships tasks + oracle + scorer + a
-single built-in control arm: the vanilla `baseline` (no injected context). The thing under test —
-a CLAUDE.md / plugins / MCP / hooks — is an **experiment the user brings**, via `--claude-md PATH`
-(or a config YAML). Run the baseline by omitting both flags. The old shipped `full-harness` config
-was removed; its onboarding CLAUDE.md now lives as a *sample experiment* in
-`examples/experiments/zulip-backend-onboarding.CLAUDE.md` (+ README with the "valid experiment doc"
-rules). `configs/` now holds only `baseline.yaml`. 46 unit tests pass.
+### Platform model (2026-07-10) — a run is just (task) -> score
+FatBench is a benchmarking **platform**. The harness invokes the agent, collects its diff, and
+scores it against the real gold tests. It does NOT inject/model/configure the agent's environment:
+whatever the user's Claude Code picks up (CLAUDE.md, plugins, MCP, hooks) is what gets measured.
+There is no "baseline"/"control" concept — every run is just a test. All context-injection was
+removed (no `config.py`, no `configs/`, no `--claude-md`/`--config`). CLI is:
+`python -m harness.run --task tasks/<id>.yaml [--name L] [--remote-host H] [--dry-run|--no-tests]`.
+The only CLAUDE.md in the repo is the repo-root dev one (for building FatBench itself).
+
+### Context bloat (2026-07-10) — the difficulty knob
+Each task declares `bloat_files` (off-solution-path decoys) + `bloat_tokens_per_file`. The harness
+inflates those files with verbose filler in the agent's workspace so its greps/reads BURN TOKENS,
+then `git checkout <parent>`-restores them BEFORE the diff is collected. So bloat drags **efficiency**
+(score/token) but NEVER reaches the oracle — correctness/regression are untouched. Oracle-safety is
+enforced two ways: the task loader rejects any `bloat_files` that overlap gold/test files, and a
+unit test proves inflate->restore leaves a byte-empty diff. Decoys = each task's red-herring
+lookalikes + large same-dir siblings (files the agent naturally reads hunting the real target).
+`harness/bloat.py`; 49 unit tests pass.
 
 ### Task set (all oracle-validated two-sided on the container)
 - **zulip-001** — add `topics_policy` realm setting. Archetype: vertical **invariant propagation**

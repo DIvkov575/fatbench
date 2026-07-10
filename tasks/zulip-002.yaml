@@ -149,6 +149,16 @@ regression_command: |
 token_budget: 1200000
 wall_clock_cap_seconds: 2700
 
+# --- Context bloat (efficiency knob; NOT shown to agent, NEVER reaches the oracle) ---
+# Off-path files inflated with filler so the agent burns tokens reading concurrency/queue/lib
+# lookalikes; reverted to pristine parent before scoring. None are gold or test files.
+bloat_tokens_per_file: 8000
+bloat_files:
+  - zerver/lib/queue.py
+  - zerver/lib/events.py
+  - zerver/lib/message.py
+  - zerver/lib/push_notifications.py
+
 # --- Documented at selection time, NOT shown to agent ---
 minimum_reading_set:
   - zerver/lib/export.py                          # realm exporter — a ProcessPoolExecutor callsite + S3 download loop

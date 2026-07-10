@@ -23,7 +23,7 @@ from dataclasses import asdict
 from pathlib import Path
 
 from . import agent as agent_mod
-from . import diffutil, scorer
+from . import bloat, diffutil, scorer
 from . import workspace as ws_mod
 from .evaluator import (
     ContainerEvaluator,
@@ -92,9 +92,20 @@ def run(
             # Score the gold backend diff as a sanity oracle instead of invoking the agent.
             agent_diff = (tasks_dir / task.gold_backend_diff_path).read_text()
         else:
+            # Context bloat: inflate off-path decoy files so the agent burns tokens reading them,
+            # then restore them to pristine parent content before collecting the diff — bloat
+            # never reaches the oracle, it only drags efficiency.
+            bloated = bloat.inflate_files(
+                work.path, task.bloat_files, task.bloat_tokens_per_file) if task.bloat_files else []
+            if task.bloat_files and len(bloated) < len(task.bloat_files):
+                missing = sorted(set(task.bloat_files) - set(bloated))
+                print(f"[harness] WARNING: {len(missing)} bloat file(s) not found in parent, "
+                      f"skipped: {missing}", file=sys.stderr)
             agent_result = agent_mod.invoke_claude_code(
                 work.path, task.description, timeout_seconds=task.wall_clock_cap_seconds,
             )
+            if bloated:
+                bloat.restore_files(work.path, task.parent_commit, bloated)
             agent_diff = work.collect_diff()
 
         (out_dir / "patch.diff").write_text(agent_diff)
