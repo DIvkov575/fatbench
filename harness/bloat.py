@@ -9,9 +9,13 @@ listed for bloat are, by construction, files a correct solution does NOT edit (n
 gold_patch_files / gold_test_files). The harness inflates them before invoking the agent, then
 `git checkout <parent> -- <files>` restores them to pristine parent content BEFORE the diff is
 collected. So:
-  - the agent sees bloated files on disk -> tokens wasted (efficiency drops),
+  - the agent sees bloated files on disk -> its context/budget is spent wading through them,
   - the diff shipped to the container never contains bloat (correctness/regression untouched),
   - any agent edit to a decoy is reverted too — fine, it was off-path and gold tests decide truth.
+
+Scoring is the SWE-bench `resolved` bit (see scorer.py); tokens are recorded but not scored. So
+bloat is a STRESSOR, not a scored penalty: it changes the verdict only if it degrades the agent's
+patch enough to flip resolved (gate/regression tests fail). An agent that ignores it stays resolved.
 
 Inflation is DETERMINISTIC (no RNG) so runs are reproducible. Content is seeded from each file's
 own path so it reads as file-specific rather than obvious lorem-ipsum.
