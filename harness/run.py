@@ -114,18 +114,15 @@ def run(
                 json.dumps(agent_result.raw_envelope, indent=2)
             )
 
-        agent_paths = diffutil.parse_changed_paths(agent_diff)
-        # Grade only the agent's IMPLEMENTATION. Its test edits are discarded before the gold
-        # tests are overlaid — otherwise the agent could pass by weakening tests (CLAUDE.md
-        # invariant "gates come from the PR, not the agent").
+        # Apply only the agent's IMPLEMENTATION; its test edits are discarded before the PR's
+        # gold tests are overlaid — otherwise the agent could "pass" by weakening tests
+        # (invariant "gates come from the PR, not the agent"). This is a staging rule, not scoring.
         impl_diff, agent_test_diff = diffutil.split_diff_by_role(agent_diff)
         (out_dir / "patch.impl.diff").write_text(impl_diff)
         if agent_test_diff.strip():
             (out_dir / "patch.agent-tests.diff").write_text(agent_test_diff)
 
-        # 4. GRADE ------------------------------------------------------------
-        file_metrics = scorer.score_files(agent_paths.impl_paths, task.gold_patch_files)
-
+        # 4. GRADE (SWE-bench style: resolved = FAIL_TO_PASS all pass AND PASS_TO_PASS all pass) -
         evaluator = pick_evaluator(no_tests, image, remote_host, task.parent_commit)
         gold_tests_diff = _read_gold_tests_diff(task, tasks_dir)
         gate_result = NullEvaluator().run_tests(work.path, task.gate_tests)  # ran=False default
@@ -133,18 +130,14 @@ def run(
         if not isinstance(evaluator, NullEvaluator):
             try:
                 evaluator.setup(work.path)
-                # Stage inside the (provisioned) env: reset -> agent IMPL diff -> overlay gold
-                # tests, so the PR's tests — not the agent's — have authority over the gates.
+                # Stage inside the provisioned env: reset -> agent IMPL diff -> overlay gold tests.
                 staged, msg = evaluator.stage(impl_diff, gold_tests_diff)
                 if not staged:
                     print(f"[harness] WARNING: staging failed: {msg}", file=sys.stderr)
-                gate_result = evaluator.run_tests(work.path, task.gate_tests)
-                regression_result = evaluator.run_command(work.path, task.regression_command)
+                gate_result = evaluator.run_tests(work.path, task.gate_tests)       # FAIL_TO_PASS
+                regression_result = evaluator.run_command(work.path, task.regression_command)  # PASS_TO_PASS
             finally:
                 evaluator.teardown()
-        correctness = scorer.score_correctness(
-            gate_result.total, gate_result.passed, gate_result.ran
-        )
         regression = (
             (1.0 if regression_result.ok else 0.0)
             if (regression_result and regression_result.ran) else -1.0
@@ -158,8 +151,9 @@ def run(
 
         tokens = agent_result.tokens_consumed if agent_result else 0
         scores = scorer.compute_scores(
-            file_metrics=file_metrics,
-            correctness=correctness,
+            gates_total=gate_result.total,
+            gates_passed=gate_result.passed,
+            gates_ran=gate_result.ran,
             regression=regression,
             tokens_consumed=tokens,
         )
