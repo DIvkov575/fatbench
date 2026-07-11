@@ -122,6 +122,11 @@ def run(
         if agent_test_diff.strip():
             (out_dir / "patch.agent-tests.diff").write_text(agent_test_diff)
 
+        # Retrieval diagnostics (separate from the verdict): file overlap of the agent's impl
+        # files vs the gold PR files. Does NOT feed `resolved`.
+        agent_paths = diffutil.parse_changed_paths(agent_diff)
+        file_metrics = scorer.score_files(agent_paths.impl_paths, task.gold_patch_files)
+
         # 4. GRADE (SWE-bench style: resolved = FAIL_TO_PASS all pass AND PASS_TO_PASS all pass) -
         evaluator = pick_evaluator(no_tests, image, remote_host, task.parent_commit)
         gold_tests_diff = _read_gold_tests_diff(task, tasks_dir)
@@ -155,6 +160,7 @@ def run(
             gates_passed=gate_result.passed,
             gates_ran=gate_result.ran,
             regression=regression,
+            file_metrics=file_metrics,
             tokens_consumed=tokens,
         )
 
