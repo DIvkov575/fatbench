@@ -44,25 +44,42 @@ def invoke_claude_code(
     timeout_seconds: int,
     extra_args: list[str] | None = None,
     claude_bin: str = "claude",
+    env: dict | None = None,
+    perm_args: list[str] | None = None,
 ) -> AgentResult:
     """Run `claude -p` on the task.
 
     The harness does NOT configure the agent's environment. Whatever the user has set up
     (CLAUDE.md in the workspace, plugins, MCP servers, hooks, settings) is what gets measured.
     The harness just invokes, collects the diff, and scores it.
+
+    `extra_args`/`env` let a caller pin the *arm*: e.g. a stripped "raw" arm passes an isolated
+    empty CLAUDE_CONFIG_DIR + `--strict-mcp-config` so no plugins/skills/MCP/CLAUDE.md load.
+    When `env` is None the child inherits this process's environment (the "as-configured" arm).
+
+    `perm_args` controls how permission checks are bypassed non-interactively (default:
+    `--dangerously-skip-permissions`). On a FRESH/isolated CLAUDE_CONFIG_DIR that flag triggers a
+    one-time acceptance dialog that can't be answered in -p mode and hangs; callers using an
+    isolated config dir should pass `["--permission-mode", "bypassPermissions"]` instead, which
+    needs no dialog.
     """
+    import os
+
     workspace_path = Path(workspace_path)
+    if perm_args is None:
+        perm_args = ["--dangerously-skip-permissions"]
     args = [
         claude_bin, "-p", prompt,
         "--output-format", "json",
-        "--dangerously-skip-permissions",
+        *perm_args,
         *(extra_args or []),
     ]
 
+    run_env = None if env is None else {**os.environ, **env}
     try:
         proc = subprocess.run(
             args, cwd=workspace_path, capture_output=True, text=True,
-            timeout=timeout_seconds,
+            timeout=timeout_seconds, env=run_env,
         )
     except subprocess.TimeoutExpired:
         return AgentResult(

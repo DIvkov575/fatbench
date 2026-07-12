@@ -11,6 +11,11 @@ repos/
 # Run artifacts — regenerable by re-running the harness.
 results/
 
+# SWE-bench comparison artifacts: run outputs, cached dataset, and cloned repo mirrors.
+# All regenerable (dataset re-fetched from HF; repos re-cloned from GitHub on demand).
+results-swebench/
+swebench/data/
+
 # Python caches
 __pycache__/
 *.py[cod]
