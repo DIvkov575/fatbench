@@ -1,5 +1,31 @@
 # FatBench Build Status
 
+## SWE-bench two-arm comparison (2026-07-12) — branch `swebench-arm-comparison`
+NEW side-experiment: measure what the user's Claude config buys on a standard benchmark. Same
+`claude -p` on the same SWE-bench Lite instances, two arms, graded by the OFFICIAL swebench oracle:
+- **raw** = vanilla claude: isolated empty `CLAUDE_CONFIG_DIR` + `--strict-mcp-config` + minimal
+  Bedrock-only `--settings`. No plugins/skills/MCP/CLAUDE.md.
+- **mine** = `claude -p` under the user's real env (config loads as normal).
+New `swebench/` pkg (stdlib+PyYAML, reuses `harness.agent`): `dataset.py` (HF rows API, cached),
+`predict.py` (clone repo@base_commit → run arm → diff → predictions JSONL + telemetry),
+`evaluate.py` (official `run_evaluation` on the remote over SSH/scp), `compare.py` (resolved rate
++ head-to-head + token/cost ratios), `run.py` (orchestrator), `arms.py` (the experiment).
+**66 unit tests pass.** VALIDATED E2E: `astropy__astropy-12907` raw-arm run through `run.py
+--remote-host` → correct patch → official grader → **resolved 1/1**. Report filename
+`<arm>.<arm>_<run_id>.json`, fields `resolved_ids`/`submitted_ids` (matches `EvalReport`).
+Key gotchas found & fixed:
+- `--dangerously-skip-permissions` HANGS on a fresh/isolated config dir (one-time trust dialog,
+  unanswerable in -p mode). Use `--permission-mode bypassPermissions` (no dialog). `agent.py`
+  gained `perm_args` (default unchanged) + `env` (both backward-compatible).
+- NOT `claude --bare`: it forces ANTHROPIC_API_KEY/apiKeyHelper and disables Bedrock (this box
+  uses Bedrock). Isolation via empty config dir + minimal settings instead.
+- Remote grading env: Cloud Desktop glibc is **2.26** (too old for modern numpy/pyarrow
+  manylinux_2_28 wheels). Installed `uv` → `~/swebench-venv` (py3.11) → `swebench` with pinned
+  `numpy==1.26.4 pyarrow==14.0.2 datasets<3` (manylinux2014 wheels). `swebench 4.1.0` imports.
+  Grade with `--remote-python /home/divkov/swebench-venv/bin/python`.
+Next: run the ~25-instance pilot with `--arms raw,mine`. `results-swebench/` + `swebench/data/`
+are gitignored. This branch is separate from the Zulip FatBench work below.
+
 ## Where we are
 
 MVP complete; now GROWING THE TASK SET. As of 2026-07-08 the benchmark has **3 validated tasks**.
