@@ -2,7 +2,7 @@
 
 import json
 
-from swebench.arms import build_mine_arm, build_raw_arm
+from swebench.arms import build_bare_arm, build_mine_arm, build_raw_arm
 
 
 def test_raw_arm_is_isolated(tmp_path):
@@ -44,6 +44,23 @@ def test_raw_arm_without_credential_export_writes_empty_settings(tmp_path):
     settings = json.loads((tmp_path / "cfg" / "settings.json").read_text())
     assert settings == {}
     assert arm.env["CLAUDE_CONFIG_DIR"] == str(tmp_path / "cfg")
+
+
+def test_bare_arm_uses_bare_flag_and_isolation(tmp_path):
+    arm = build_bare_arm(
+        config_dir=tmp_path / "barecfg",
+        aws_credential_export='"/path/to/claude" default-credential-export',
+        model="global.anthropic.claude-opus-4-8",
+    )
+    assert arm.name == "bare"
+    # --bare strips skills/hooks/CLAUDE.md; --strict-mcp-config kills MCP.
+    assert "--bare" in arm.extra_args
+    assert "--strict-mcp-config" in arm.extra_args
+    assert "--mcp-config" not in arm.extra_args
+    # Isolated config dir + auth-only settings (so the toolbox can't leak rules into ~/.claude).
+    assert arm.env["CLAUDE_CONFIG_DIR"] == str(tmp_path / "barecfg")
+    settings = json.loads((tmp_path / "barecfg" / "settings.json").read_text())
+    assert set(settings.keys()) <= {"awsCredentialExport"}
 
 
 def test_mine_arm_inherits_env():

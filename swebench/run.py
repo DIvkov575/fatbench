@@ -25,7 +25,7 @@ from pathlib import Path
 
 from . import compare as compare_mod
 from . import predict as predict_mod
-from .arms import build_mine_arm, build_raw_arm
+from .arms import build_bare_arm, build_mine_arm, build_raw_arm
 from .dataset import DEFAULT_DATASET, load_instances
 from .evaluate import RemoteSweBenchGrader, check_remote_ready
 
@@ -57,10 +57,16 @@ def build_arms(names: list[str], out_dir: Path, model: str | None) -> list:
                 aws_credential_export=_default_aws_credential_export(),
                 model=model,
             ))
+        elif name == "bare":
+            arms.append(build_bare_arm(
+                config_dir=out_dir / "bare-config",
+                aws_credential_export=_default_aws_credential_export(),
+                model=model,
+            ))
         elif name == "mine":
             arms.append(build_mine_arm(model=model))
         else:
-            raise ValueError(f"unknown arm '{name}' (expected 'raw' or 'mine')")
+            raise ValueError(f"unknown arm '{name}' (expected 'raw', 'bare', or 'mine')")
     return arms
 
 
