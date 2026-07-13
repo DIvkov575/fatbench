@@ -1,0 +1,140 @@
+id: zulip-003
+title: "Add API endpoint to schedule reminders"
+source_pr: "https://github.com/zulip/zulip/pull/34505"
+source_commit: "733817cb510fa3a5540161ee9a58365445c3cab4"
+# parent_commit CORRECTED (2026-07-08): PR #34505 was rebase-merged as 2 linear commits
+# (ad9cb501 first, 733817cb head). author.py's merge_commit_sha^ heuristic returned ad9cb501 —
+# the PR's OWN first commit, not the pre-PR state — on which the gold diff does NOT apply.
+# True parent = ad9cb501^ = 1af039d8. Verified: gold-backend+gold-tests apply cleanly here and
+# the new reminders files are absent. (Same rebase-merge bug found for zulip-002; fix author.py.)
+parent_commit: "1af039d87bad7d7400a94ba2a0710f1208a1367e"
+merged_date: "2025-05-02"            # post knowledge-cutoff (May 2025) — contamination-controlled
+repo: zulip
+language: python
+type: T3                              # subsystem extension / reuse of existing delivery machinery
+tier: medium
+
+# Repo scale (proves retrieval pressure): 416K LOC Python total, 345K in zerver/ backend.
+# Full load infeasible within 1M-token budget — agent must triage.
+
+description: |
+  Zulip lets users schedule messages to be delivered at a future time. Add a
+  new capability that lets a user set a reminder about a specific existing
+  message, to be delivered to themselves at a chosen future time.
+
+  Requirements:
+  - Expose a JSON API endpoint `POST /json/reminders` that takes the id of an
+    existing message the user can access and a future delivery time (a Unix
+    timestamp). On success it schedules the reminder and returns the created
+    reminder's id as `reminder_id`.
+  - The reminder, when it comes due, must be delivered to the requesting user
+    as a message that references the original message (its content is rendered
+    at delivery time).
+  - A request whose delivery time is not in the future must be rejected with an
+    error.
+  - A request that references a message the user cannot access must be rejected.
+  - Reminders must be delivered by the same mechanism that already delivers
+    other future-dated (scheduled) messages — do not build a separate delivery
+    system or scheduler. Extend the existing infrastructure so that reminders
+    flow through it correctly, including how a due item is picked up, rendered,
+    and delivered.
+
+  Scope: BACKEND ONLY. Do not modify `web/` frontend code. The task is judged
+  on backend correctness and integration with the existing delivery subsystem.
+
+# --- Methodology note (NOT shown to agent) ---
+# The gold test (test_reminders.py) posts to the literal URL `/json/reminders` and reads
+# `reminder_id` from the success response. Because the gold test pins this public HTTP
+# surface, the prompt deliberately specifies the endpoint path, its two request parameters
+# (message id + future delivery timestamp), and the `reminder_id` response field. It does
+# NOT name any internal model, function, or file. The fat-context skill under measurement is
+# NOT "invent an API" — it is "discover and correctly reuse the pre-existing scheduled-message
+# delivery subsystem (model row shape, the delivery loop, and rendering) rather than standing
+# up a parallel reminders system." The failure mode this task targets is a self-contained
+# reminders implementation that never integrates with the shared delivery machinery: its
+# delivery assertions fail and the scheduled-messages regression suite breaks. Same documented
+# exception as zulip-001, scoped to the public endpoint the test pins.
+
+# --- Gold patch (real merged diff), backend only ---
+# Excludes: web/src/compose_reply.ts (frontend); version.py + api_docs/*.md (version-bump/doc
+# noise, kept in the raw backend diff but NOT part of the implementation surface).
+gold_patch_files:
+  - zerver/actions/reminders.py
+  - zerver/actions/scheduled_messages.py
+  - zerver/lib/reminders.py
+  - zerver/lib/message.py
+  - zerver/lib/exceptions.py
+  - zerver/lib/markdown/fenced_code.py
+  - zerver/models/scheduled_jobs.py
+  - zerver/views/reminders.py
+  - zerver/views/scheduled_messages.py
+  - zerver/openapi/zulip.yaml
+  - zproject/urls.py
+  - zerver/migrations/0699_scheduledmessage_reminder_target_message_id.py
+
+# Migration filenames are gold-specific; completeness scoring matches on the
+# non-migration files + "added >=1 migration" rather than exact migration names.
+
+# --- Gate tests (the tests the PR added/changed; applied from gold, run vs agent impl) ---
+gold_test_files:
+  - zerver/tests/test_reminders.py
+  - zerver/tests/test_scheduled_messages.py
+  - zerver/tests/test_openapi.py
+
+gate_tests:
+  - "zerver/tests/test_reminders.py::RemindersTest"          # primary — posts /json/reminders, asserts delivery
+  - "zerver/tests/test_scheduled_messages.py::ScheduledMessageTest"  # shared delivery-path regression-as-gate
+  # VALIDATED 2026-07-08 on the provisioned container (two-sided oracle), parent 1af039d8:
+  #   PASS (gold-backend+gold-tests): RemindersTest 7 + ScheduledMessageTest 14 = 21 OK;
+  #     regression command = 21 OK. New migration 0699_...reminder... runs in the test-DB build.
+  #   FAIL (gold-tests alone on parent): RemindersTest all 7 methods FAIL (POST /json/reminders
+  #     -> 404, endpoint absent). ScheduledMessageTest PASSES on the parent — by design, it is
+  #     regression-as-gate (catches a broken refactor of the shared delivery loop), not an
+  #     absence-detector. So the FAIL-side proof rests on RemindersTest.
+  # Harness op-note: parent deps differ from the snapshot venv -> ContainerEvaluator must pass
+  # `--skip-provision-check` and `uv sync --frozen --group dev --inexact` before tests; stage
+  # files OUTSIDE /srv/zulip. Its lockfile differs from zulip-002's (re-sync when switching). See STATUS.md.
+  # Pinned at CLASS granularity (test-backend runs only module/class labels, never single methods).
+
+regression_command: |
+  # Scoped backend regression — reminder + scheduled-message delivery paths.
+  ./tools/test-backend zerver.tests.test_reminders zerver.tests.test_scheduled_messages
+
+token_budget: 1200000
+wall_clock_cap_seconds: 2700
+
+# --- Context bloat (efficiency knob; NOT shown to agent, NEVER reaches the oracle) ---
+# Off-path files inflated with filler so the agent burns tokens on message/scheduling lookalikes
+# + large same-dir siblings; reverted to pristine parent before scoring. None are gold/test files.
+bloat_tokens_per_file: 8000
+bloat_files:
+  - zerver/actions/message_send.py
+  - zerver/lib/timestamp.py
+  - zerver/lib/events.py
+  - zerver/lib/export.py
+
+# --- Documented at selection time, NOT shown to agent ---
+minimum_reading_set:
+  - zerver/models/scheduled_jobs.py         # ScheduledMessage row shape + delivery_type discriminator
+  - zerver/actions/scheduled_messages.py    # the delivery loop (try_deliver_one_scheduled_message)
+  - zerver/views/scheduled_messages.py      # endpoint pattern to mirror for the new route
+  - zerver/lib/exceptions.py                # JsonableError pattern for the new delivery-time error
+  - zerver/lib/message.py                   # message access checks + render helpers reused at delivery
+  - zproject/urls.py                        # where /json/* routes are registered
+  - "an existing scheduled-message delivery test"  # expected delivery behavior to mirror
+
+red_herrings:
+  - web/src/compose_reply.ts                # frontend reminder UI — out of scope
+  - zerver/actions/message_send.py          # message-adjacent but NOT the reminder/scheduled path
+  - zerver/lib/timestamp.py                 # timestamp helpers look central but are incidental
+  - version.py                              # bumped in gold, not implementation
+  - api_docs/changelog.md                   # doc-only, not implementation
+
+attributes:
+  scatter: medium        # ~11 files across 7 dirs (actions/lib/models/views/migrations/openapi/urls)
+  snr: low               # relevant files drowned among hundreds of zerver/*.py
+  red_herrings: medium   # scheduled_messages + message_send look adjacent; frontend reminder UI
+  inferential_distance: medium  # must discover the reuse target (existing delivery subsystem)
+  ambiguity: low         # public endpoint pinned; the "what" is clear, the "where to hook" is not
+  coupling: deep         # new path depends transitively on the existing scheduled-message delivery loop
+  spec: under            # outcome + public surface specified, integration points not

@@ -17,9 +17,6 @@ import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
-CLAUDE_MD = "CLAUDE.md"
-
-
 def _git(args: list[str], cwd: Path, check: bool = True) -> subprocess.CompletedProcess:
     return subprocess.run(
         ["git", *args], cwd=cwd, check=check, capture_output=True, text=True
@@ -32,22 +29,13 @@ class Workspace:
     parent_commit: str
     _tmp_root: Path
 
-    def write_claude_md(self, content: str) -> None:
-        (self.path / CLAUDE_MD).write_text(content)
-
-    def collect_diff(self, exclude_claude_md: bool = True) -> str:
-        """Diff of the agent's changes vs the parent-commit baseline.
+    def collect_diff(self) -> str:
+        """Diff of the agent's changes vs the parent commit.
 
         Includes tracked modifications AND newly created files (the agent adds new
         migrations / new lib files). We stage everything first so `git diff --cached`
-        captures untracked files, then diff against the baseline commit.
+        captures untracked files, then diff against the parent commit.
         """
-        # Optionally drop an injected CLAUDE.md so it isn't scored as an agent edit.
-        if exclude_claude_md:
-            cm = self.path / CLAUDE_MD
-            if cm.exists():
-                cm.unlink()
-
         _git(["add", "-A"], cwd=self.path)
         proc = _git(
             ["diff", "--cached", "--no-color", self.parent_commit],

@@ -1,5 +1,0 @@
-# Full-harness config: inject a Zulip onboarding CLAUDE.md, as a senior contributor would
-# brief a new hire (LLD.md §7). Tests whether encoding institutional knowledge measurably
-# improves the agent's solution. Body lives in full-harness.CLAUDE.md (relative to this file).
-name: full-harness
-claude_md_file: full-harness.CLAUDE.md

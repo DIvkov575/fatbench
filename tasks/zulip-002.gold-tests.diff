@@ -1,0 +1,464 @@
+diff --git a/zerver/tests/test_import_export.py b/zerver/tests/test_import_export.py
+index 9dd2d9a0a014e..549c337907312 100644
+--- a/zerver/tests/test_import_export.py
++++ b/zerver/tests/test_import_export.py
+@@ -53,7 +53,6 @@
+     Record,
+     do_export_realm,
+     do_export_user,
+-    export_usermessages_batch,
+     get_consented_user_ids,
+ )
+ from zerver.lib.import_realm import do_import_realm, get_incoming_message_ids
+@@ -416,7 +415,7 @@ def export_realm(
+             do_export_realm(
+                 realm=realm,
+                 output_dir=output_dir,
+-                threads=0,
++                processes=1,
+                 export_type=export_type,
+                 exportable_user_ids=exportable_user_ids,
+             )
+@@ -427,13 +426,6 @@ def export_realm(
+             realm.uuid = uuid.uuid4()
+             realm.save()
+ 
+-            export_usermessages_batch(
+-                input_path=os.path.join(output_dir, "messages-000001.json.partial"),
+-                output_path=os.path.join(output_dir, "messages-000001.json"),
+-                export_full_with_consent=export_type == RealmExport.EXPORT_FULL_WITH_CONSENT,
+-                consented_user_ids=exportable_user_ids,
+-            )
+-
+     def export_realm_and_create_auditlog(
+         self,
+         original_realm: Realm,
+diff --git a/zerver/tests/test_management_commands.py b/zerver/tests/test_management_commands.py
+index 6ffa91cf3f524..9b31fed0646f4 100644
+--- a/zerver/tests/test_management_commands.py
++++ b/zerver/tests/test_management_commands.py
+@@ -537,7 +537,7 @@ def test_command_to_export_full_with_consent(self) -> None:
+             call_command(self.COMMAND_NAME, "-r=zulip", "--export-full-with-consent")
+             m.assert_called_once_with(
+                 export_row=mock.ANY,
+-                threads=mock.ANY,
++                processes=mock.ANY,
+                 output_dir=mock.ANY,
+                 percent_callback=mock.ANY,
+                 upload=False,
+diff --git a/zerver/tests/test_mattermost_importer.py b/zerver/tests/test_mattermost_importer.py
+index 1177cae0988dc..ecb3100dd04f2 100644
+--- a/zerver/tests/test_mattermost_importer.py
++++ b/zerver/tests/test_mattermost_importer.py
+@@ -484,7 +484,6 @@ def test_process_message_attachments(self) -> None:
+             realm_id=3,
+             message_id=1,
+             user_id=2,
+-            user_handler=user_handler,
+             zerver_attachment=zerver_attachments,
+             uploads_list=uploads_list,
+             mattermost_data_dir=mattermost_data_dir,
+@@ -501,7 +500,7 @@ def test_process_message_attachments(self) -> None:
+         self.assertTrue(zerver_attachments[0]["is_realm_public"])
+ 
+         self.assert_length(uploads_list, 1)
+-        self.assertEqual(uploads_list[0]["user_profile_email"], "ron@zulip.com")
++        self.assertEqual(uploads_list[0]["user_profile_id"], 2)
+ 
+         attachment_path = self.fixture_file_name(
+             mattermost_data["post"]["direct_post"][0]["attachments"][0]["path"],
+diff --git a/zerver/tests/test_parallel.py b/zerver/tests/test_parallel.py
+new file mode 100644
+index 0000000000000..d6419f48d0097
+--- /dev/null
++++ b/zerver/tests/test_parallel.py
+@@ -0,0 +1,306 @@
++import glob
++import logging
++import os
++import shutil
++import tempfile
++import time
++from collections import Counter
++from multiprocessing import current_process
++
++from django.db import connection
++
++from zerver.lib.parallel import _disconnect, run_parallel, run_parallel_queue
++from zerver.lib.partial import partial
++from zerver.lib.test_classes import ZulipTestCase
++from zerver.models import Realm
++
++
++class RunNotParallelTest(ZulipTestCase):
++    def test_disconnect(self) -> None:
++        self.assertTrue(connection.is_usable())
++        self.assertEqual(Realm.objects.count(), 4)
++        _disconnect()
++        self.assertFalse(connection.is_usable())
++
++    def test_not_parallel(self) -> None:
++        # Nothing here is parallel, or forks at all
++        events = []
++
++        run_parallel(
++            lambda item: events.append(f"Item: {item}"),
++            range(100, 110),
++            processes=1,
++            initializer=lambda a, b: events.append(f"Init: {a}, {b}"),
++            initargs=("alpha", "bravo"),
++            report_every=3,
++            report=lambda n: events.append(f"Completed {n}"),
++        )
++
++        self.assertEqual(
++            events,
++            [
++                "Init: alpha, bravo",
++                "Item: 100",
++                "Item: 101",
++                "Item: 102",
++                "Completed 3",
++                "Item: 103",
++                "Item: 104",
++                "Item: 105",
++                "Completed 6",
++                "Item: 106",
++                "Item: 107",
++                "Item: 108",
++                "Completed 9",
++                "Item: 109",
++            ],
++        )
++
++    def test_not_parallel_throw(self) -> None:
++        events = []
++
++        def do_work(item: int) -> None:
++            if item == 103:
++                raise Exception("I don't like threes")
++            events.append(f"Item: {item}")
++
++        with self.assertRaisesRegex(Exception, "I don't like threes"):
++            run_parallel(
++                do_work,
++                range(100, 110),
++                processes=1,
++                report_every=5,
++                report=lambda n: events.append(f"Completed {n}"),
++                catch=False,
++            )
++
++        self.assertEqual(
++            events,
++            [
++                "Item: 100",
++                "Item: 101",
++                "Item: 102",
++            ],
++        )
++
++    def test_not_parallel_catch(self) -> None:
++        events = []
++
++        def do_work(item: int) -> None:
++            if item == 103:
++                raise Exception("I don't like threes")
++            events.append(f"Item: {item}")
++
++        with self.assertLogs(level="ERROR") as error_logs:
++            run_parallel(
++                do_work,
++                range(100, 105),
++                processes=1,
++                report_every=5,
++                report=lambda n: events.append(f"Completed {n}"),
++                catch=True,
++            )
++
++        self.assert_length(error_logs.output, 1)
++        self.assertTrue(
++            error_logs.output[0].startswith("ERROR:root:Error processing item: 103\nTraceback")
++        )
++        self.assertIn("I don't like threes", error_logs.output[0])
++
++        self.assertEqual(
++            events,
++            [
++                "Item: 100",
++                "Item: 101",
++                "Item: 102",
++                "Item: 104",
++                # We "completed" the one which raised an exception,
++                # despite it not having output
++                "Completed 5",
++            ],
++        )
++
++    def test_not_parallel_queue(self) -> None:
++        events = []
++
++        with run_parallel_queue(
++            lambda item: events.append(f"Item: {item}"),
++            processes=1,
++            report_every=3,
++            report=lambda n: events.append(f"Completed {n}"),
++            initializer=lambda a, b: events.append(f"Init: {a}, {b}"),
++            initargs=("alpha", "bravo"),
++        ) as do_work:
++            self.assertEqual(events, ["Init: alpha, bravo"])
++            do_work(100)
++            self.assertEqual(
++                events,
++                [
++                    "Init: alpha, bravo",
++                    "Item: 100",
++                ],
++            )
++            do_work(101)
++            do_work(102)
++        self.assertEqual(
++            events,
++            [
++                "Init: alpha, bravo",
++                "Item: 100",
++                "Item: 101",
++                "Item: 102",
++                "Completed 3",
++            ],
++        )
++
++
++def write_number(
++    output_dir: str, total_processes: int, fail: set[int], item: int
++) -> None:  # nocoverage
++    if item in fail:
++        raise Exception("Whoops")
++
++    with open(f"{output_dir}/{os.getpid()}.output", "a") as fh:
++        fh.write(f"{item}\n")
++    # We wait to exit until we see total_processes unique files in the
++    # output directory, so we ensure that every PID got a chance to
++    # run.
++    slept = 0
++    while len(glob.glob(f"{output_dir}/*.output")) < total_processes and slept < 5:
++        time.sleep(1)
++        slept += 1
++
++
++def db_query(output_dir: str, total_processes: int, item: int) -> None:  # nocoverage
++    connection.connect()
++    with open(f"{output_dir}/{os.getpid()}.output", "a") as fh:
++        fh.write(f"{Realm.objects.count()}\n")
++    slept = 0
++    while len(glob.glob(f"{output_dir}/*.output")) < total_processes and slept < 5:
++        time.sleep(1)
++        slept += 1
++
++
++class RunParallelTest(ZulipTestCase):
++    def skip_in_parallel_harness(self) -> None:
++        if current_process().daemon:
++            self.skipTest("Testing of parallel pool is skipped under the parallel test harness")
++
++    def test_parallel(self) -> None:  # nocoverage
++        self.skip_in_parallel_harness()
++
++        output_dir = tempfile.mkdtemp()
++        report_lines = []
++        try:
++            run_parallel(
++                partial(write_number, output_dir, 4, set()),
++                range(100, 110),
++                processes=4,
++                report_every=3,
++                report=lambda n: report_lines.append(f"Completed {n}"),
++            )
++
++            files = glob.glob(f"{output_dir}/*.output")
++            self.assert_length(files, 4)
++            all_lines: Counter[str] = Counter()
++            for output_path in files:
++                with open(output_path) as output_file:
++                    file_lines = output_file.readlines()
++                    self.assertGreater(len(file_lines), 0)
++                    self.assertLessEqual(len(file_lines), 10 - (4 - 1))
++                    self.assertEqual(sorted(file_lines), file_lines)
++                    all_lines.update(file_lines)
++
++            self.assertEqual(all_lines.total(), 10)
++            self.assertEqual(sorted(all_lines.keys()), [f"{n}\n" for n in range(100, 110)])
++
++            self.assertEqual(report_lines, ["Completed 3", "Completed 6", "Completed 9"])
++        finally:
++            shutil.rmtree(output_dir)
++
++    def test_parallel_throw(self) -> None:  # nocoverage
++        self.skip_in_parallel_harness()
++        output_dir = tempfile.mkdtemp()
++        report_lines = []
++        try:
++            with self.assertRaisesMessage(Exception, "Whoops"):
++                run_parallel(
++                    partial(write_number, output_dir, 4, {103}),
++                    range(100, 105),
++                    processes=2,
++                    report_every=5,
++                    report=lambda n: report_lines.append(f"Completed {n}"),
++                )
++            output_files = glob.glob(f"{output_dir}/*.output")
++            self.assert_length(output_files, 2)
++            all_lines: set[int] = set()
++            for output_path in output_files:
++                with open(output_path) as output_file:
++                    all_lines.update(int(line) for line in output_file)
++            self.assertIn(100, all_lines)
++            self.assertIn(101, all_lines)
++            self.assertNotIn(103, all_lines)
++            self.assertEqual(report_lines, [])
++        finally:
++            shutil.rmtree(output_dir)
++
++    def test_parallel_catch(self) -> None:  # nocoverage
++        self.skip_in_parallel_harness()
++        output_dir = tempfile.mkdtemp()
++        report_lines = []
++
++        def set_file_logger(output_dir: str) -> None:
++            # In each worker process, we set up the logger to write to
++            # a (pid).error file.
++            logging.basicConfig(
++                filename=f"{output_dir}/{os.getpid()}.error",
++                level=logging.INFO,
++                filemode="w",
++                force=True,
++            )
++
++        try:
++            run_parallel(
++                partial(write_number, output_dir, 4, {103}),
++                range(100, 105),
++                processes=2,
++                report_every=5,
++                report=lambda n: report_lines.append(f"Completed {n}"),
++                catch=True,
++                initializer=set_file_logger,
++                initargs=(output_dir,),
++            )
++            output_files = glob.glob(f"{output_dir}/*.output")
++            self.assert_length(output_files, 2)
++            all_lines: set[int] = set()
++            for output_path in output_files:
++                with open(output_path) as output_file:
++                    all_lines.update(int(line) for line in output_file)
++            self.assertEqual(sorted(all_lines), [100, 101, 102, 104])
++            self.assertEqual(report_lines, ["Completed 5"])
++
++            error_files = glob.glob(f"{output_dir}/*.error")
++            error_lines = []
++            self.assert_length(error_files, 2)
++            for error_path in error_files:
++                with open(error_path) as error_file:
++                    error_lines.extend(error_file.readlines())
++            self.assertEqual(error_lines[0], "ERROR:root:Error processing item: 103\n")
++        finally:
++            shutil.rmtree(output_dir)
++
++    def test_parallel_reconnect(self) -> None:  # nocoverage
++        self.skip_in_parallel_harness()
++        output_dir = tempfile.mkdtemp()
++        run_parallel(
++            partial(db_query, output_dir, 2),
++            range(100, 105),
++            processes=2,
++        )
++        output_files = glob.glob(f"{output_dir}/*.output")
++        self.assert_length(output_files, 2)
++        all_lines: set[int] = set()
++        for output_path in output_files:
++            with open(output_path) as output_file:
++                all_lines.update(int(line) for line in output_file)
++        self.assertEqual(all_lines, {4})
+diff --git a/zerver/tests/test_realm_export.py b/zerver/tests/test_realm_export.py
+index 0b72ae4a58eee..56801aa197bcc 100644
+--- a/zerver/tests/test_realm_export.py
++++ b/zerver/tests/test_realm_export.py
+@@ -63,7 +63,7 @@ def test_endpoint_s3(self) -> None:
+         self.assertEqual(args["realm"], admin.realm)
+         self.assertEqual(args["export_type"], RealmExport.EXPORT_PUBLIC)
+         self.assertTrue(os.path.basename(args["output_dir"]).startswith("zulip-export-"))
+-        self.assertEqual(args["threads"], 6)
++        self.assertEqual(args["processes"], 6)
+ 
+         # Get the entry and test that iago initiated it.
+         export_row = RealmExport.objects.first()
+@@ -121,7 +121,7 @@ def test_endpoint_local_uploads(self) -> None:
+         def fake_export_realm(
+             realm: Realm,
+             output_dir: str,
+-            threads: int,
++            processes: int,
+             export_type: int,
+             exportable_user_ids: set[int] | None = None,
+             export_as_active: bool | None = None,
+@@ -129,7 +129,7 @@ def fake_export_realm(
+             self.assertEqual(realm, admin.realm)
+             self.assertEqual(export_type, RealmExport.EXPORT_PUBLIC)
+             self.assertTrue(os.path.basename(output_dir).startswith("zulip-export-"))
+-            self.assertEqual(threads, 6)
++            self.assertEqual(processes, 6)
+ 
+             # Check that the export shows up as in progress
+             result = self.client_get("/json/export/realm")
+diff --git a/zerver/tests/test_rocketchat_importer.py b/zerver/tests/test_rocketchat_importer.py
+index 31f7324eaa975..be3d977bd1b17 100644
+--- a/zerver/tests/test_rocketchat_importer.py
++++ b/zerver/tests/test_rocketchat_importer.py
+@@ -876,7 +876,6 @@ def test_process_message_attachment(self) -> None:
+             realm_id=3,
+             message_id=1,
+             user_id=3,
+-            user_handler=user_handler,
+             zerver_attachment=zerver_attachments,
+             uploads_list=uploads_list,
+             upload_id_to_upload_data_map=upload_id_to_upload_data_map,
+@@ -893,7 +892,7 @@ def test_process_message_attachment(self) -> None:
+         self.assertTrue(zerver_attachments[0]["is_realm_public"])
+ 
+         self.assert_length(uploads_list, 1)
+-        self.assertEqual(uploads_list[0]["user_profile_email"], "harrypotter@email.com")
++        self.assertEqual(uploads_list[0]["user_profile_id"], 3)
+ 
+         attachment_out_path = os.path.join(output_dir, "uploads", zerver_attachments[0]["path_id"])
+         self.assertTrue(os.path.exists(attachment_out_path))
+diff --git a/zerver/tests/test_slack_importer.py b/zerver/tests/test_slack_importer.py
+index fe506d4c0d9cb..99ec7eebd01b0 100644
+--- a/zerver/tests/test_slack_importer.py
++++ b/zerver/tests/test_slack_importer.py
+@@ -1929,7 +1929,7 @@ def test_slack_import_to_existing_database(
+         with self.assertLogs(level="INFO"), self.settings(EXTERNAL_HOST="zulip.example.com"):
+             # We need to mock EXTERNAL_HOST to be a valid domain because Slack's importer
+             # uses it to generate email addresses for users without an email specified.
+-            do_convert_zipfile(test_slack_zip_file, output_dir, token)
++            do_convert_zipfile(test_slack_zip_file, output_dir, token, processes=1)
+ 
+         self.assertTrue(os.path.exists(output_dir))
+         self.assertTrue(os.path.exists(output_dir + "/realm.json"))
+@@ -2047,7 +2047,7 @@ def test_message_files(self) -> None:
+ 
+         self.assertEqual(uploads_list[0]["s3_path"], image_path)
+         self.assertEqual(uploads_list[0]["realm_id"], realm_id)
+-        self.assertEqual(uploads_list[0]["user_profile_email"], "alice@example.com")
++        self.assertEqual(uploads_list[0]["user_profile_id"], alice_id)
+ 
+     def test_bot_duplicates(self) -> None:
+         self.assertEqual(
+@@ -2138,7 +2138,7 @@ def test_slack_import_unicode_filenames(
+         with self.assertLogs(level="INFO"), self.settings(EXTERNAL_HOST="zulip.example.com"):
+             # We need to mock EXTERNAL_HOST to be a valid domain because Slack's importer
+             # uses it to generate email addresses for users without an email specified.
+-            do_convert_zipfile(test_slack_zip_file, output_dir, token)
++            do_convert_zipfile(test_slack_zip_file, output_dir, token, processes=1)
+ 
+     @mock.patch("zerver.data_import.slack.check_slack_token_access")
+     @responses.activate

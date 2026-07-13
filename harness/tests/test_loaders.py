@@ -1,8 +1,7 @@
-"""task + config loaders, against the real task/config files."""
+"""task loader tests, against the real task files."""
 
 from pathlib import Path
 
-from harness.config import load_config
 from harness.task import load_task
 
 ROOT = Path(__file__).resolve().parent.parent.parent
@@ -21,17 +20,3 @@ def test_load_zulip_task():
     assert "zerver/models/realms.py" not in t.description
 
 
-def test_baseline_config_no_claude_md():
-    c = load_config(ROOT / "configs" / "baseline.yaml")
-    assert c.name == "baseline"
-    assert c.claude_md is None
-    assert not c.writes_claude_md
-
-
-def test_full_harness_config_loads_external_md():
-    c = load_config(ROOT / "configs" / "full-harness.yaml")
-    assert c.name == "full-harness"
-    assert c.writes_claude_md
-    assert "test-backend" in c.claude_md
-    # The harness CLAUDE.md must NOT leak the task's specific setting name.
-    assert "topics_policy" not in c.claude_md

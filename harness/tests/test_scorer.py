@@ -1,93 +1,91 @@
-"""scorer tests: file metrics (migration-aware), gate logic, composite."""
+"""scorer tests: SWE-bench `resolved` verdict + separate retrieval diagnostics.
 
-from harness import scorer
+Verdict and diagnostics are independent metric groups — a test asserts they don't influence
+each other.
+"""
+
+from harness.scorer import Scores, compute_scores, score_files
 
 GOLD = [
     "zerver/models/realms.py",
     "zerver/actions/realm_settings.py",
     "zerver/lib/events.py",
-    "zerver/views/realm.py",
-    "zerver/migrations/0710_realm_topics_policy.py",
-    "zerver/migrations/0711_set_default_value_for_realm_topics_policy.py",
+    "zerver/migrations/0710_realm_topics_policy.py",  # migration -> one synthetic slot
 ]
-# 4 distinct non-migration gold files + 1 migration slot = 5 slots.
 
 
-def test_perfect_match_with_differently_named_migration():
+def _fm(agent_files):
+    return score_files(agent_files, GOLD)
+
+
+def _score(total, passed, gates_ran=True, regression=1.0, agent_files=None, tokens=100_000):
+    fm = _fm(agent_files if agent_files is not None else GOLD)
+    return compute_scores(gates_total=total, gates_passed=passed, gates_ran=gates_ran,
+                          regression=regression, file_metrics=fm, tokens_consumed=tokens)
+
+
+# --- verdict (resolved bit) ----------------------------------------------------------------
+
+def test_resolved_when_all_gates_and_regression_pass():
+    s = _score(5, 5, regression=1.0)
+    assert s.resolved and s.fail_to_pass and s.pass_to_pass
+    assert s.fail_to_pass_detail == "5/5" and s.ran
+
+
+def test_not_resolved_when_a_gate_fails():
+    s = _score(5, 4, regression=1.0)
+    assert not s.resolved and not s.fail_to_pass and s.pass_to_pass
+
+
+def test_not_resolved_when_regression_fails():
+    s = _score(5, 5, regression=0.0)
+    assert not s.resolved and s.fail_to_pass and not s.pass_to_pass
+
+
+def test_tests_did_not_run_is_not_meaningful():
+    s = _score(5, 0, gates_ran=False, regression=-1.0)
+    assert not s.resolved and not s.ran
+    assert any("did not run" in n for n in s.notes)
+
+
+# --- retrieval diagnostics (file overlap) --------------------------------------------------
+
+def test_perfect_overlap_with_differently_named_migration():
     agent = [
-        "zerver/models/realms.py",
-        "zerver/actions/realm_settings.py",
-        "zerver/lib/events.py",
-        "zerver/views/realm.py",
-        "zerver/migrations/0710_something_else.py",  # different name, still a migration
+        "zerver/models/realms.py", "zerver/actions/realm_settings.py", "zerver/lib/events.py",
+        "zerver/migrations/9999_totally_different_name.py",  # counts via migration slot
     ]
-    m = scorer.score_files(agent, GOLD)
-    assert m.completeness == 1.0
-    assert m.precision == 1.0
-    assert m.migration_satisfied
+    fm = _fm(agent)
+    assert fm.completeness == 1.0 and fm.precision == 1.0
+    assert fm.migration_satisfied
 
 
-def test_missing_event_layer_lowers_completeness():
-    agent = [
-        "zerver/models/realms.py",
-        "zerver/views/realm.py",
-        "zerver/migrations/0710_x.py",
-    ]
-    m = scorer.score_files(agent, GOLD)
-    # matched: realms.py, realm.py (2) + migration (1) = 3 of 5 slots
-    assert m.completeness == 0.6
-    assert "zerver/lib/events.py" in m.missed
-    assert m.precision == 1.0  # everything it touched was correct
+def test_missing_layer_lowers_completeness_only():
+    agent = ["zerver/models/realms.py", "zerver/actions/realm_settings.py"]  # missing events + migration
+    fm = _fm(agent)
+    assert fm.completeness < 1.0
+    assert "zerver/lib/events.py" in fm.missed
 
 
-def test_extra_files_hurt_precision():
-    agent = [
-        "zerver/models/realms.py",
-        "zerver/lib/streams.py",   # red herring, not in gold
-        "zerver/migrations/0710_x.py",
-    ]
-    m = scorer.score_files(agent, GOLD)
-    # agent slots: 2 non-mig + 1 mig = 3; correct: realms.py + migration = 2
-    assert round(m.precision, 4) == round(2 / 3, 4)
-    assert "zerver/lib/streams.py" in m.extra
+def test_extra_files_lower_precision_only():
+    agent = GOLD + ["zerver/lib/streams.py"]  # a red-herring the agent wrongly touched
+    fm = _fm(agent)
+    assert fm.completeness == 1.0        # still hit everything gold wanted
+    assert fm.precision < 1.0            # but touched an extra
+    assert "zerver/lib/streams.py" in fm.extra
 
 
-def test_no_migration_when_expected():
-    agent = ["zerver/models/realms.py"]
-    m = scorer.score_files(agent, GOLD)
-    assert m.migration_expected
-    assert not m.migration_satisfied
-    assert any("migration" in x for x in m.missed)
+# --- independence: diagnostics never move the verdict, tokens never scored -----------------
+
+def test_diagnostics_do_not_affect_resolved():
+    # Terrible file overlap but all tests pass -> still resolved. Verdict ignores diagnostics.
+    s = _score(3, 3, regression=1.0, agent_files=["totally/unrelated.py"])
+    assert s.resolved is True
+    assert s.completeness == 0.0  # diagnostics reflect the bad overlap, verdict doesn't care
 
 
-def test_correctness_hard_gate():
-    assert scorer.score_correctness(4, 4, ran=True) == 1.0
-    assert scorer.score_correctness(4, 3, ran=True) == 0.0   # partial -> 0
-    assert scorer.score_correctness(4, 0, ran=True) == 0.0
-    assert scorer.score_correctness(4, 4, ran=False) == -1.0  # unknown
-
-
-def test_composite_unknown_tests_flagged():
-    m = scorer.score_files(GOLD, GOLD)  # perfect files
-    s = scorer.compute_scores(
-        file_metrics=m, correctness=-1.0, regression=-1.0, tokens_consumed=500_000
-    )
-    assert s.completeness == 1.0
-    assert s.correctness == -1.0
-    assert any("UNKNOWN" in n for n in s.notes)
-    # composite uses 0 for unknown correctness/regression but full file metrics.
-    assert 0 < s.composite < 1
-
-
-def test_composite_full_pass():
-    m = scorer.score_files(GOLD, GOLD)
-    s = scorer.compute_scores(
-        file_metrics=m, correctness=1.0, regression=1.0, tokens_consumed=400_000
-    )
-    # correctness 1, completeness 1, precision 1, regression 1, plus efficiency.
-    assert s.composite > 0.9
-    assert s.efficiency > 0
-
-
-def test_efficiency_zero_tokens():
-    assert scorer.efficiency_norm(0.5, 0) == 0.0
+def test_tokens_are_metadata_only():
+    a = _score(3, 3, tokens=50_000)
+    b = _score(3, 3, tokens=5_000_000)
+    assert a.resolved == b.resolved is True
+    assert a.tokens_consumed != b.tokens_consumed
