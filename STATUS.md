@@ -23,8 +23,27 @@ Key gotchas found & fixed:
   manylinux_2_28 wheels). Installed `uv` → `~/swebench-venv` (py3.11) → `swebench` with pinned
   `numpy==1.26.4 pyarrow==14.0.2 datasets<3` (manylinux2014 wheels). `swebench 4.1.0` imports.
   Grade with `--remote-python /home/divkov/swebench-venv/bin/python`.
-Next: run the ~25-instance pilot with `--arms raw,mine`. `results-swebench/` + `swebench/data/`
-are gitignored. This branch is separate from the Zulip FatBench work below.
+`results-swebench/` + `swebench/data/` are gitignored. This branch is separate from the Zulip
+FatBench work below.
+
+### Three-arm pilot DONE (N=25, first 25 Lite instances = astropy+django). Writeup: `analysis/swebench-three-arm.md`
+| arm | loads | resolved | rate | total$ | avg tok | tok/turn |
+|-----|-------|---------:|-----:|-------:|--------:|---------:|
+| bare | `--bare`: Bash/Read/Edit only, no skills/plugins/MCP/rules | 17/25 | 68% | $17.90 | 42K | 1,383 |
+| raw | isolated cfg: NO user plugins/MCP, but toolbox still injects built-in skills + amazon rules | 18/25 | 72% | $16.89 | 31K | 1,565 |
+| mine | full user setup (plugins/skills/MCP/hooks/CLAUDE.md) | 24/25 | 96% | $45.16 | 100K | 3,044 |
+
+- **Resolved sets nest perfectly: 17 ⊂ 18 ⊂ 24, zero regressions.** Richer config = strict Pareto gain here.
+- **bare→raw ≈ noise** (+1 solve): built-in skills/org rules don't help Python bugfixing.
+- **The whole lift is the user's plugins/MCP/hooks (raw→mine): +6 solves, 72%→96%**, at ~2.7× cost.
+- **Why mine burns 3.3× tokens:** ~2× per-turn context (plugin/skill/MCP tool schemas + rules +
+  CLAUDE.md re-sent every turn) × ~1.7× more turns. Biggest lever = MCP/plugin tool schemas
+  irrelevant to coding. One blemish: mine empty-patched `django-11630` (aborted at 1 turn).
+- **KEY CORRECTION:** the original 2-arm "raw" was mislabeled "vanilla" — the Amazon toolbox
+  repopulates a fresh CLAUDE_CONFIG_DIR with skills+rules on startup. `--bare` is the only truly
+  minimal switch (and it auths via the Bedrock export in --settings despite its API-key default).
+- Open experiment: `mine`-minus-MCP arm (skills/hooks/CLAUDE.md kept, `--strict-mcp-config`) to see
+  if 96% holds at lower token cost. Next scale step: full 300-instance Lite.
 
 ## Where we are
 
